@@ -54,6 +54,8 @@ class FPFHFeatures(Features):
 
 
     def get_fpfh_features(self,unorganized_pc, voxel_size=0.1):
+        if getattr(self.args, 'agg_method', 'mean') == 'ncrp' and not self.args.use_LFSA:
+            raise ValueError('NCRP requires use_LFSA=True; use the same setting for Mean ablations.')
         # unorganized_pc:(1,n,3)--> (n,3)
         unorganized_pc = unorganized_pc.squeeze(0).numpy() #(n,3)
 
@@ -88,7 +90,7 @@ class FPFHFeatures(Features):
                 fpfh3 = torch.Tensor(pcd_fpfh.data.T).cuda()
 
 
-                fpfh = torch.cat([fpfh,fpfh2,fpfh3],dim=-1)
+                fpfh = torch.cat([fpfh,fpfh3],dim=-1)
         
         # fps the centers out
         # unorganized_pc_no_zeros expected (1,n,3)
@@ -180,6 +182,10 @@ class FPFHFeatures(Features):
         else:
             feature_maps,_,_,_ = self.get_features(pc)
             self.patch_lib.append(feature_maps)
+
+    def collect_calibration_scores(self, pc):
+        structure, residual, _, _, _ = self.get_features(pc)
+        self.add_ncrp_calibration_sample(structure, residual)
 
     def predict(self, pc, mask, label, path=None):
         # agg_point_feature (group,33)

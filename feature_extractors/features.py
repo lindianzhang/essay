@@ -128,6 +128,8 @@ class Features(torch.nn.Module):
         set_seeds(0)
         self.patch_lib = []
         self.residual_patch_lib = []
+        self.ncrp_structure_calibration = []
+        self.ncrp_residual_calibration = []
         self.anomaly_patch_lib = []
         self.pre_patch_lib = []
         self.tmp_patch_lib = []
@@ -173,37 +175,70 @@ class Features(torch.nn.Module):
 
 
 
+    def _ncrp_branch_scores(self, patch, residual_patch):
+        if residual_patch is None:
+            raise ValueError('NCRP requires a residual descriptor for each query patch.')
+
+        # Retrieve normal residual statistics using only structural similarity.
+        dist = torch.cdist(patch, self.patch_lib)
+        neighbor_count = min(5, self.patch_lib.shape[0])
+        nearest_dist, nearest_idx = torch.topk(dist, neighbor_count, dim=1, largest=False)
+        normal_residuals = self.residual_patch_lib[nearest_idx]
+        residual_mean = normal_residuals.mean(dim=1)
+        residual_std = normal_residuals.std(dim=1, unbiased=False)
+        residual_scale = torch.maximum(
+            residual_std, 0.1 * self.residual_feature_std.unsqueeze(0)
+        ).clamp_min(1e-6)
+        residual_score = (
+            (residual_patch - residual_mean).clamp_min(0) / residual_scale
+        ).mean(dim=1)
+        return nearest_dist[:, 0], residual_score
+
+    def add_ncrp_calibration_sample(self, patch, residual_patch):
+        structure_score, residual_score = self._ncrp_branch_scores(patch, residual_patch)
+        self.ncrp_structure_calibration.append(structure_score.detach().cpu())
+        self.ncrp_residual_calibration.append(residual_score.detach().cpu())
+
+    def fit_ncrp_score_calibration(self):
+        if not self.ncrp_structure_calibration or not self.ncrp_residual_calibration:
+            raise ValueError('NCRP needs independent normal training samples for score calibration.')
+
+        # The held-out normal training patches define fixed, test-independent scales.
+        structure_scores = torch.cat(self.ncrp_structure_calibration)
+        residual_scores = torch.cat(self.ncrp_residual_calibration)
+        self.ncrp_structure_center = torch.quantile(structure_scores, 0.5).to(self.args.device)
+        self.ncrp_residual_center = torch.quantile(residual_scores, 0.5).to(self.args.device)
+        self.ncrp_structure_scale = (
+            torch.quantile(structure_scores, 0.9).to(self.args.device)
+            - self.ncrp_structure_center
+        ).clamp_min(1e-6)
+        self.ncrp_residual_scale = (
+            torch.quantile(residual_scores, 0.9).to(self.args.device)
+            - self.ncrp_residual_center
+        ).clamp_min(1e-6)
+        self.ncrp_structure_calibration.clear()
+        self.ncrp_residual_calibration.clear()
+
     def compute_anomay_scores(self, patch, mask, label, path, unorganized_pc, unorganized_pc_no_zeros, center, residual_patch=None):
 
-        dist = torch.cdist(patch, self.patch_lib)  
         if getattr(self.args, 'agg_method', 'mean') == 'ncrp':
-            if residual_patch is None:
-                raise ValueError('NCRP requires a residual descriptor for each query patch.')
-
-            # Retrieve normal residual statistics using only structural similarity.
-            neighbor_count = min(5, self.patch_lib.shape[0])
-            nearest_dist, nearest_idx = torch.topk(dist, neighbor_count, dim=1, largest=False)
-            normal_residuals = self.residual_patch_lib[nearest_idx]
-            residual_mean = normal_residuals.mean(dim=1)
-            residual_std = normal_residuals.std(dim=1, unbiased=False)
-
-            # Fixed training-bank scales keep scores comparable across test samples.
-            structure_score = nearest_dist[:, 0] / self.structure_scale
-            residual_scale = torch.maximum(
-                residual_std, 0.1 * self.residual_feature_std.unsqueeze(0)
-            ).clamp_min(1e-6)
+            structure_score, residual_score = self._ncrp_branch_scores(patch, residual_patch)
+            structure_score = (
+                (structure_score - self.ncrp_structure_center) / self.ncrp_structure_scale
+            ).clamp_min(0)
             residual_score = (
-                (residual_patch - residual_mean).clamp_min(0) / residual_scale
-            ).mean(dim=1)
+                (residual_score - self.ncrp_residual_center) / self.ncrp_residual_scale
+            ).clamp_min(0)
             min_val = 0.5 * structure_score + 0.5 * residual_score
         else:
+            dist = torch.cdist(patch, self.patch_lib)
             min_val, min_idx = torch.min(dist, dim=1)
 
         feature_map_dims = patch.shape[0]
         s_map = min_val.view(1, 1, feature_map_dims)
 
 
-        if self.args.use_LFSA or getattr(self.args, 'agg_method', 'mean') == 'ncrp':
+        if self.args.use_LFSA:
             s_map = interpolating_points_chunked(unorganized_pc_no_zeros.permute(0,2,1).to(self.args.device), center.permute(0,2,1).to(self.args.device), s_map.to(self.args.device)).permute(0,2,1)
             s_map = torch.Tensor(self.unorganized_data_to_organized(unorganized_pc, [s_map])[0])
 
@@ -348,7 +383,6 @@ class Features(torch.nn.Module):
                 self.residual_patch_lib = self.residual_patch_lib[self.coreset_idx].to(self.args.device)
 
         if use_ncrp:
-            self.structure_scale = self.patch_lib.std(dim=0, unbiased=False).norm().clamp_min(1e-6)
             self.residual_feature_std = self.residual_patch_lib.std(dim=0, unbiased=False)
 
                

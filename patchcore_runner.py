@@ -33,11 +33,33 @@ class PatchCore():
 
     def fit(self, class_name):
         train_loader = self.get_dataloader(self.dataset_name,'train',class_name,level=self.level)
-        for pc, _, _, path in tqdm(train_loader, desc=f'Extracting train features for class {class_name}'):
+        train_count = len(train_loader)
+        use_ncrp = getattr(self.args, 'agg_method', 'mean') == 'ncrp'
+        if use_ncrp and train_count < 2:
+            raise ValueError('NCRP requires at least two normal training samples for independent calibration.')
+
+        # Use the same memory-bank subset in Mean and NCRP ablations.
+        calibration_indices = set()
+        if train_count >= 2:
+            calibration_count = min(train_count - 1, max(1, (train_count + 4) // 5))
+            calibration_indices = set(
+                np.random.RandomState(0).choice(train_count, calibration_count, replace=False).tolist()
+            )
+
+        for index, (pc, _, _, path) in enumerate(tqdm(train_loader, desc=f'Extracting train features for class {class_name}')):
+            if index in calibration_indices:
+                continue
             self.method.collect_features(pc)
             self.method.name_list.append(path)
         print(f'\n\nRunning coreset on class {class_name}...')
         self.method.run_coreset()
+
+        if use_ncrp:
+            # Score only held-out normal training samples; never use test data.
+            for index, (pc, _, _, _) in enumerate(tqdm(train_loader, desc=f'Calibrating NCRP for class {class_name}')):
+                if index in calibration_indices:
+                    self.method.collect_calibration_scores(pc)
+            self.method.fit_ncrp_score_calibration()
 
 
     def evaluate(self, class_name):

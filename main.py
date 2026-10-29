@@ -13,6 +13,8 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+LOG_DIR = Path('logs')
+
 
 class TeeLogger:
     """同时输出到终端和日志文件"""
@@ -35,6 +37,7 @@ class TeeLogger:
 
 def setup_logging():
     """设置日志文件，默认保存到 autodl-tmp/log/ 或本地 logs/"""
+    global LOG_DIR
     # 尝试 AutoDL 路径（Linux），失败则用本地路径
     if os.name == 'posix':  # Linux/Unix
         log_dirs = [
@@ -58,6 +61,7 @@ def setup_logging():
     if log_dir is None:
         log_dir = Path("logs")
         log_dir.mkdir(parents=True, exist_ok=True)
+    LOG_DIR = log_dir
 
     # 生成日志文件名：2026-10-26-20-19.txt
     timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M")
@@ -77,7 +81,8 @@ def setup_logging():
 
 
 def write_experiment_log(expname, strs):
-    with open(f"./logs/{expname}.txt", 'a') as f:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    with (LOG_DIR / f"{expname}.txt").open('a', encoding='utf-8') as f:
         f.write(strs)
 
 
@@ -174,7 +179,7 @@ if __name__ == '__main__':
         parser.add_argument('--num_group', type=int, default=2048, help='num_group')
         parser.add_argument('--group_size', type=int, default=128, help='group_size')
         parser.add_argument('--agg_method', type=str, choices=['mean', 'ncrp'], default='mean',
-                            help='mean: original Simple3D; ncrp: normality-calibrated residual pooling')
+                            help='mean: original Simple3D; ncrp: residual pooling (requires --use_LFSA True)')
         parser.add_argument('--use_MSND', type=bool, default=False)
         parser.add_argument('--use_LFSA', type=bool, default=False)
         parser.add_argument('--vis_save', type=bool, default=False)
@@ -182,6 +187,8 @@ if __name__ == '__main__':
         parser.add_argument('--feature', type=str, default='FPFH')
         parser.add_argument('--level', type=str, default='ALL')
         args = parser.parse_args()
+        if args.agg_method == 'ncrp' and not args.use_LFSA:
+            parser.error('NCRP requires --use_LFSA True; use the same LFSA setting for Mean ablations.')
         print(args)
 
         run_3d_ads(args)
