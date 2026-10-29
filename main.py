@@ -97,9 +97,8 @@ def run_3d_ads(args):
         classes = mulsen_classes() 
     if args.dataset == 'minishift':
         classes = minishiftAD_classes() 
-    METHOD_NAMES = [
-        "Simple3D",
-        ]
+    method_name = 'NCRP' if getattr(args, 'agg_method', 'mean') == 'ncrp' else 'Simple3D'
+    METHOD_NAMES = [method_name]
 
     image_rocaucs_df = pd.DataFrame(METHOD_NAMES, columns=['Method'])
     pixel_rocaucs_df = pd.DataFrame(METHOD_NAMES, columns=['Method'])
@@ -114,23 +113,23 @@ def run_3d_ads(args):
         print(f"\nRunning on class {cls}\n")
         write_experiment_log(args.expname,f"\nRunning on class {cls}\n")
         image_rocaucs, pixel_rocaucs, au_pros = patchcore.evaluate(cls)
-        image_rocaucs_df[cls.title()] = image_rocaucs_df['Method'].map(image_rocaucs)
-        pixel_rocaucs_df[cls.title()] = pixel_rocaucs_df['Method'].map(pixel_rocaucs)
-        au_pros_df[cls.title()] = au_pros_df['Method'].map(au_pros)
+        image_rocaucs_df[cls.title()] = image_rocaucs_df['Method'].map({method_name: image_rocaucs['Simple3D']})
+        pixel_rocaucs_df[cls.title()] = pixel_rocaucs_df['Method'].map({method_name: pixel_rocaucs['Simple3D']})
+        au_pros_df[cls.title()] = au_pros_df['Method'].map({method_name: au_pros['Simple3D']})
 
         # 立即输出当前类别的结果
         print(f"\n{'='*80}")
         print(f"Finished class {cls}")
         print(f"{'='*80}")
-        print(f"O-AUROC: {image_rocaucs['Simple3D']:.3f}")
-        print(f"P-AUROC: {pixel_rocaucs['Simple3D']:.3f}")
+        print(f"{method_name} O-AUROC: {image_rocaucs['Simple3D']:.3f}")
+        print(f"{method_name} P-AUROC: {pixel_rocaucs['Simple3D']:.3f}")
         print(f"{'='*80}\n")
 
         result_str = (f"\n{'='*80}\n"
                      f"Finished class {cls}\n"
                      f"{'='*80}\n"
-                     f"O-AUROC: {image_rocaucs['Simple3D']:.3f}\n"
-                     f"P-AUROC: {pixel_rocaucs['Simple3D']:.3f}\n"
+                     f"{method_name} O-AUROC: {image_rocaucs['Simple3D']:.3f}\n"
+                     f"{method_name} P-AUROC: {pixel_rocaucs['Simple3D']:.3f}\n"
                      f"{'='*80}\n\n")
         write_experiment_log(args.expname, result_str)
         # write_experiment_log(args.expname,"################################################################################\n\n")
@@ -174,6 +173,8 @@ if __name__ == '__main__':
         parser.add_argument('--max_nn', type=int, default=100, help='max_nn')
         parser.add_argument('--num_group', type=int, default=2048, help='num_group')
         parser.add_argument('--group_size', type=int, default=128, help='group_size')
+        parser.add_argument('--agg_method', type=str, choices=['mean', 'ncrp'], default='mean',
+                            help='mean: original Simple3D; ncrp: normality-calibrated residual pooling')
         parser.add_argument('--use_MSND', type=bool, default=False)
         parser.add_argument('--use_LFSA', type=bool, default=False)
         parser.add_argument('--vis_save', type=bool, default=False)

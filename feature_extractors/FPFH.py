@@ -113,7 +113,20 @@ class FPFHFeatures(Features):
         # print("neighborhood",neighborhood.shape)
         agg_point_feature = torch.mean(neighborhood,-2)
 
-        if self.args.use_LFSA:
+        if getattr(self.args, 'agg_method', 'mean') == 'ncrp':
+            # Each group keeps its original mean and a separate residual descriptor.
+            absolute_residual = (neighborhood - agg_point_feature.unsqueeze(-2)).abs()
+            residual_std = absolute_residual.square().mean(dim=-2).sqrt()
+            residual_q90 = torch.quantile(absolute_residual, 0.9, dim=-2)
+            residual_weights = torch.softmax(
+                absolute_residual / residual_std.clamp_min(1e-6).unsqueeze(-2), dim=-2
+            )
+            residual_high = (residual_weights * absolute_residual).sum(dim=-2)
+            residual_feature = torch.cat(
+                (residual_std, residual_q90, residual_high), dim=-1
+            ).squeeze(0)
+            agg_point_feature = agg_point_feature.squeeze(0)
+        elif self.args.use_LFSA:
             agg_point_feature = agg_point_feature.squeeze()
         else:
             agg_point_feature = fpfh.squeeze()
@@ -126,9 +139,13 @@ class FPFHFeatures(Features):
         # center (1,group,3)
 
         # print(agg_point_feature.shape,unorganized_pc.shape,unorganized_pc_no_zeros.shape,center.shape)
+        if getattr(self.args, 'agg_method', 'mean') == 'ncrp':
+            return agg_point_feature,residual_feature,unorganized_pc,unorganized_pc_no_zeros,center
         return agg_point_feature,unorganized_pc,unorganized_pc_no_zeros,center
 
     def get_features(self,unorganized_pc):
+        if getattr(self.args, 'agg_method', 'mean') == 'ncrp' and self.args.feature != 'FPFH':
+            raise ValueError('NCRP requires FPFH features.')
         if self.args.feature == 'FPFH':
             return self.get_fpfh_features(unorganized_pc)
         if self.args.feature == 'shape_context':
@@ -156,8 +173,13 @@ class FPFHFeatures(Features):
         # unorganized_pc_no_zeros (1,n,3)
         # center (1,group,3)
 
-        feature_maps,_,_,_ = self.get_features(pc)
-        self.patch_lib.append(feature_maps)
+        if getattr(self.args, 'agg_method', 'mean') == 'ncrp':
+            structure, residual, _, _, _ = self.get_features(pc)
+            self.patch_lib.append(structure)
+            self.residual_patch_lib.append(residual)
+        else:
+            feature_maps,_,_,_ = self.get_features(pc)
+            self.patch_lib.append(feature_maps)
 
     def predict(self, pc, mask, label, path=None):
         # agg_point_feature (group,33)
@@ -165,9 +187,12 @@ class FPFHFeatures(Features):
         # unorganized_pc_no_zeros (1,n,3)
         # center (1,group,3)
 
-        agg_point_feature,unorganized_pc,unorganized_pc_no_zeros,center = self.get_features(pc)
-        self.compute_anomay_scores(agg_point_feature, mask, label,path, unorganized_pc,unorganized_pc_no_zeros,center)
-
-
-
- 
+        if getattr(self.args, 'agg_method', 'mean') == 'ncrp':
+            structure, residual, unorganized_pc, unorganized_pc_no_zeros, center = self.get_features(pc)
+            self.compute_anomay_scores(
+                structure, mask, label, path, unorganized_pc,
+                unorganized_pc_no_zeros, center, residual_patch=residual
+            )
+        else:
+            agg_point_feature,unorganized_pc,unorganized_pc_no_zeros,center = self.get_features(pc)
+            self.compute_anomay_scores(agg_point_feature, mask, label,path, unorganized_pc,unorganized_pc_no_zeros,center)

@@ -127,6 +127,7 @@ class Features(torch.nn.Module):
         self.n_reweight = 3
         set_seeds(0)
         self.patch_lib = []
+        self.residual_patch_lib = []
         self.anomaly_patch_lib = []
         self.pre_patch_lib = []
         self.tmp_patch_lib = []
@@ -172,16 +173,37 @@ class Features(torch.nn.Module):
 
 
 
-    def compute_anomay_scores(self, patch, mask, label, path, unorganized_pc, unorganized_pc_no_zeros, center):
+    def compute_anomay_scores(self, patch, mask, label, path, unorganized_pc, unorganized_pc_no_zeros, center, residual_patch=None):
 
         dist = torch.cdist(patch, self.patch_lib)  
-        min_val, min_idx = torch.min(dist, dim=1)
+        if getattr(self.args, 'agg_method', 'mean') == 'ncrp':
+            if residual_patch is None:
+                raise ValueError('NCRP requires a residual descriptor for each query patch.')
+
+            # Retrieve normal residual statistics using only structural similarity.
+            neighbor_count = min(5, self.patch_lib.shape[0])
+            nearest_dist, nearest_idx = torch.topk(dist, neighbor_count, dim=1, largest=False)
+            normal_residuals = self.residual_patch_lib[nearest_idx]
+            residual_mean = normal_residuals.mean(dim=1)
+            residual_std = normal_residuals.std(dim=1, unbiased=False)
+
+            # Fixed training-bank scales keep scores comparable across test samples.
+            structure_score = nearest_dist[:, 0] / self.structure_scale
+            residual_scale = torch.maximum(
+                residual_std, 0.1 * self.residual_feature_std.unsqueeze(0)
+            ).clamp_min(1e-6)
+            residual_score = (
+                (residual_patch - residual_mean).clamp_min(0) / residual_scale
+            ).mean(dim=1)
+            min_val = 0.5 * structure_score + 0.5 * residual_score
+        else:
+            min_val, min_idx = torch.min(dist, dim=1)
 
         feature_map_dims = patch.shape[0]
         s_map = min_val.view(1, 1, feature_map_dims)
 
 
-        if self.args.use_LFSA:
+        if self.args.use_LFSA or getattr(self.args, 'agg_method', 'mean') == 'ncrp':
             s_map = interpolating_points_chunked(unorganized_pc_no_zeros.permute(0,2,1).to(self.args.device), center.permute(0,2,1).to(self.args.device), s_map.to(self.args.device)).permute(0,2,1)
             s_map = torch.Tensor(self.unorganized_data_to_organized(unorganized_pc, [s_map])[0])
 
@@ -307,6 +329,11 @@ class Features(torch.nn.Module):
 
     def run_coreset(self):
         self.patch_lib = torch.cat(self.patch_lib, 0).cpu()
+        use_ncrp = getattr(self.args, 'agg_method', 'mean') == 'ncrp'
+        if use_ncrp:
+            self.residual_patch_lib = torch.cat(self.residual_patch_lib, 0).cpu()
+            if self.residual_patch_lib.shape[0] != self.patch_lib.shape[0]:
+                raise ValueError('Structure and residual memory banks must have matching rows.')
         n = len(self.patch_lib)
 
         self.f_coreset = 0.05
@@ -316,6 +343,13 @@ class Features(torch.nn.Module):
                                                             eps=self.coreset_eps, )
 
             self.patch_lib = self.patch_lib[self.coreset_idx].to(self.args.device)
+            if use_ncrp:
+                # Select both banks with the same coreset indices to preserve alignment.
+                self.residual_patch_lib = self.residual_patch_lib[self.coreset_idx].to(self.args.device)
+
+        if use_ncrp:
+            self.structure_scale = self.patch_lib.std(dim=0, unbiased=False).norm().clamp_min(1e-6)
+            self.residual_feature_std = self.residual_patch_lib.std(dim=0, unbiased=False)
 
                
 
@@ -368,4 +402,3 @@ class Features(torch.nn.Module):
             min_distances[select_idx] = 0
             coreset_idx.append(select_idx.to("cpu"))
         return torch.stack(coreset_idx)
-
