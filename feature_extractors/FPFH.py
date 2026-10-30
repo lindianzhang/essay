@@ -90,7 +90,11 @@ class FPFHFeatures(Features):
                 fpfh3 = torch.Tensor(pcd_fpfh.data.T).cuda()
 
 
-                fpfh = torch.cat([fpfh,fpfh3],dim=-1)
+                if getattr(self.args, 'msnd_impl', 'official') == 'official':
+                    # Preserve the author's published concatenation: base, second, second, third.
+                    fpfh = torch.cat([fpfh,fpfh2,fpfh3],dim=-1)
+                else:
+                    fpfh = torch.cat([fpfh,fpfh3],dim=-1)
         
         # fps the centers out
         # unorganized_pc_no_zeros expected (1,n,3)

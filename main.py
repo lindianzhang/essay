@@ -16,6 +16,16 @@ from pathlib import Path
 LOG_DIR = Path('logs')
 
 
+def parse_bool(value):
+    if isinstance(value, bool):
+        return value
+    if value.lower() in ('true', '1', 'yes'):
+        return True
+    if value.lower() in ('false', '0', 'no'):
+        return False
+    raise argparse.ArgumentTypeError('Expected True or False.')
+
+
 class TeeLogger:
     """同时输出到终端和日志文件"""
     def __init__(self, log_file):
@@ -103,6 +113,8 @@ def run_3d_ads(args):
     if args.dataset == 'minishift':
         classes = minishiftAD_classes() 
     method_name = 'NCRP' if getattr(args, 'agg_method', 'mean') == 'ncrp' else 'Simple3D'
+    if args.use_MSND:
+        method_name += f' ({getattr(args, "msnd_impl", "official")} MSND)'
     METHOD_NAMES = [method_name]
 
     image_rocaucs_df = pd.DataFrame(METHOD_NAMES, columns=['Method'])
@@ -120,7 +132,10 @@ def run_3d_ads(args):
         image_rocaucs, pixel_rocaucs, au_pros = patchcore.evaluate(cls)
         image_rocaucs_df[cls.title()] = image_rocaucs_df['Method'].map({method_name: image_rocaucs['Simple3D']})
         pixel_rocaucs_df[cls.title()] = pixel_rocaucs_df['Method'].map({method_name: pixel_rocaucs['Simple3D']})
-        au_pros_df[cls.title()] = au_pros_df['Method'].map({method_name: au_pros['Simple3D']})
+        if args.dataset == 'real':
+            au_pros_df[cls.title()] = 'Not calculated'
+        else:
+            au_pros_df[cls.title()] = au_pros_df['Method'].map({method_name: au_pros['Simple3D']})
 
         # 立即输出当前类别的结果
         print(f"\n{'='*80}")
@@ -142,7 +157,10 @@ def run_3d_ads(args):
 
     image_rocaucs_df['Mean'] = round(image_rocaucs_df.iloc[:, 1:].mean(axis=1),3)
     pixel_rocaucs_df['Mean'] = round(pixel_rocaucs_df.iloc[:, 1:].mean(axis=1),3)
-    au_pros_df['Mean'] = round(au_pros_df.iloc[:, 1:].mean(axis=1),3)
+    if args.dataset == 'real':
+        au_pros_df['Mean'] = 'Not calculated'
+    else:
+        au_pros_df['Mean'] = round(au_pros_df.iloc[:, 1:].mean(axis=1),3)
 
     print("\n\n################################################################################")
     print("############################# Image ROCAUC Results #############################")
@@ -175,18 +193,37 @@ if __name__ == '__main__':
         parser.add_argument('--expname', type=str, default='None', help='expname')
         parser.add_argument('--device', type=str, default='cuda:0', help='expname')
         parser.add_argument('--dataset', type=str, default='shapenet', help='dataset name')
-        parser.add_argument('--max_nn', type=int, default=100, help='max_nn')
-        parser.add_argument('--num_group', type=int, default=2048, help='num_group')
+        parser.add_argument('--max_nn', type=int, default=None, help='max_nn')
+        parser.add_argument('--num_group', type=int, default=None, help='num_group')
         parser.add_argument('--group_size', type=int, default=128, help='group_size')
         parser.add_argument('--agg_method', type=str, choices=['mean', 'ncrp'], default='mean',
                             help='mean: original Simple3D; ncrp: residual pooling (requires --use_LFSA True)')
-        parser.add_argument('--use_MSND', type=bool, default=False)
-        parser.add_argument('--use_LFSA', type=bool, default=False)
-        parser.add_argument('--vis_save', type=bool, default=False)
+        parser.add_argument('--msnd_impl', choices=['official', 'fixed'], default='official')
+        parser.add_argument('--use_MSND', type=parse_bool, default=None)
+        parser.add_argument('--use_LFSA', type=parse_bool, default=None)
+        parser.add_argument('--vis_save', type=parse_bool, default=False)
         parser.add_argument('--num_MSND', type=int, default=2)
         parser.add_argument('--feature', type=str, default='FPFH')
         parser.add_argument('--level', type=str, default='ALL')
+        parser.add_argument('--official_real3d', action='store_true',
+                            help='Default to the official Real3D-AD settings and preprocessed format')
+        parser.add_argument('--real3d_format', choices=['pcd', 'official'], default=None,
+                            help='PCD server data or the author\'s preprocessed ASC/TXT data')
+        parser.add_argument('--real3d_root', type=str, default=None,
+                            help='Root of the official preprocessed Real3D-AD dataset')
         args = parser.parse_args()
+        if args.official_real3d:
+            args.dataset = 'real'
+        if args.num_group is None:
+            args.num_group = 4096 if args.official_real3d else 2048
+        if args.max_nn is None:
+            args.max_nn = 40 if args.official_real3d else 100
+        if args.use_MSND is None:
+            args.use_MSND = args.official_real3d
+        if args.use_LFSA is None:
+            args.use_LFSA = args.official_real3d
+        if args.real3d_format is None:
+            args.real3d_format = 'official' if args.official_real3d else 'pcd'
         if args.agg_method == 'ncrp' and not args.use_LFSA:
             parser.error('NCRP requires --use_LFSA True; use the same LFSA setting for Mean ablations.')
         print(args)

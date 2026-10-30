@@ -349,8 +349,10 @@ class Features(torch.nn.Module):
 
         self.image_rocauc = roc_auc_score(self.image_labels, self.image_preds)
 
-        # Check if pixel labels have both classes
-        if len(np.unique(self.pixel_labels)) > 1:
+        if getattr(self.args, 'agg_method', 'mean') == 'mean':
+            # Keep the author's evaluation protocol for the Simple3D baseline.
+            self.pixel_rocauc = roc_auc_score(self.pixel_labels, self.pixel_preds)
+        elif len(np.unique(self.pixel_labels)) > 1:
             self.pixel_rocauc = roc_auc_score(self.pixel_labels, self.pixel_preds)
         else:
             self.pixel_rocauc = 0.0

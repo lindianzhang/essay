@@ -23,7 +23,11 @@ class PatchCore():
         if dataset_name == 'mvtec':
             return get_mvtec_loader(split, class_name=class_name)
         if dataset_name == 'real':
-            return get_real_loader(split, class_name=class_name)
+            return get_real_loader(
+                split, class_name=class_name,
+                data_format=getattr(self.args, 'real3d_format', 'pcd'),
+                data_root=getattr(self.args, 'real3d_root', None),
+            )
         if dataset_name == 'shapenet':
             return get_shapenet_loader(split, class_name=class_name)
         if dataset_name == 'mulsen':
@@ -33,18 +37,25 @@ class PatchCore():
 
     def fit(self, class_name):
         train_loader = self.get_dataloader(self.dataset_name,'train',class_name,level=self.level)
-        train_count = len(train_loader)
         use_ncrp = getattr(self.args, 'agg_method', 'mean') == 'ncrp'
-        if use_ncrp and train_count < 2:
+
+        if not use_ncrp:
+            # Official Simple3D uses every normal training sample for the memory bank.
+            for pc, _, _, path in tqdm(train_loader, desc=f'Extracting train features for {class_name}'):
+                self.method.collect_features(pc)
+                self.method.name_list.append(path)
+            print(f'\n\nRunning coreset on class {class_name}...')
+            self.method.run_coreset()
+            return
+
+        train_count = len(train_loader)
+        if train_count < 2:
             raise ValueError('NCRP requires at least two normal training samples for independent calibration.')
 
-        # Use the same memory-bank subset in Mean and NCRP ablations.
-        calibration_indices = set()
-        if train_count >= 2:
-            calibration_count = min(train_count - 1, max(1, (train_count + 4) // 5))
-            calibration_indices = set(
-                np.random.RandomState(0).choice(train_count, calibration_count, replace=False).tolist()
-            )
+        calibration_count = min(train_count - 1, max(1, (train_count + 4) // 5))
+        calibration_indices = set(
+            np.random.RandomState(0).choice(train_count, calibration_count, replace=False).tolist()
+        )
 
         for index, (pc, _, _, path) in enumerate(tqdm(train_loader, desc=f'Extracting train features for class {class_name}')):
             if index in calibration_indices:
@@ -54,12 +65,11 @@ class PatchCore():
         print(f'\n\nRunning coreset on class {class_name}...')
         self.method.run_coreset()
 
-        if use_ncrp:
-            # Score only held-out normal training samples; never use test data.
-            for index, (pc, _, _, _) in enumerate(tqdm(train_loader, desc=f'Calibrating NCRP for class {class_name}')):
-                if index in calibration_indices:
-                    self.method.collect_calibration_scores(pc)
-            self.method.fit_ncrp_score_calibration()
+        # Score only held-out normal training samples; never use test data.
+        for index, (pc, _, _, _) in enumerate(tqdm(train_loader, desc=f'Calibrating NCRP for class {class_name}')):
+            if index in calibration_indices:
+                self.method.collect_calibration_scores(pc)
+        self.method.fit_ncrp_score_calibration()
 
 
     def evaluate(self, class_name):
@@ -79,7 +89,8 @@ class PatchCore():
         image_rocaucs[method_name] = round(self.method.image_rocauc, 3)
         pixel_rocaucs[method_name] = round(self.method.pixel_rocauc, 3)
         au_pros[method_name] = round(self.method.au_pro, 3)
+        display_name = 'NCRP' if getattr(self.args, 'agg_method', 'mean') == 'ncrp' else method_name
+        au_pro_text = 'not calculated' if self.args.dataset == 'real' else f'{self.method.au_pro:.3f}'
         print(
-            f'Class: {class_name}, {method_name} Image ROCAUC: {self.method.image_rocauc:.3f}, {method_name} Pixel ROCAUC: {self.method.pixel_rocauc:.3f}, {method_name} AU-PRO: {self.method.au_pro:.3f}')
+            f'Class: {class_name}, {display_name} Image ROCAUC: {self.method.image_rocauc:.3f}, {display_name} Pixel ROCAUC: {self.method.pixel_rocauc:.3f}, {display_name} AU-PRO: {au_pro_text}')
         return image_rocaucs, pixel_rocaucs, au_pros
-
