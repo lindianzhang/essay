@@ -207,6 +207,12 @@ if __name__ == '__main__':
         parser.add_argument('--geom_seed', type=int, default=42)
         parser.add_argument('--curvature_k', type=int, default=32)
         parser.add_argument('--pseudo_per_sample', type=int, default=10)
+        parser.add_argument(
+            '--pseudo_generator',
+            type=str,
+            choices=['custom', 'nature3d'],
+            default='custom'
+        )
         parser.add_argument('--geom_use_position', type=parse_bool, default=True)
         parser.add_argument('--geom_use_curvature', type=parse_bool, default=True)
         parser.add_argument('--msnd_impl', choices=['official', 'fixed'], default='official')

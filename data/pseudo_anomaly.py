@@ -1,4 +1,5 @@
 import numpy as np
+import open3d as o3d
 from scipy.spatial import cKDTree
 
 
@@ -72,3 +73,69 @@ def generate_pseudo_anomaly(points, anomaly_type, rng, config):
                           'spacing': spacing}, 'strength': float(strength),
                 'direction': direction.tolist()}
     return changed.astype(np.asarray(points).dtype, copy=False), mask.astype(np.uint8), metadata
+
+
+def estimate_nature3d_normals(points):
+    """Estimate unit normals and orient them away from the point cloud center."""
+    points = np.asarray(points)
+    if points.ndim != 2 or points.shape[1] != 3 or len(points) == 0:
+        raise ValueError('points must have shape [N, 3] with at least one point.')
+    cloud = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points.astype(np.float64)))
+    cloud.estimate_normals(o3d.geometry.KDTreeSearchParamKNN(knn=min(30, len(points))))
+    normals = np.asarray(cloud.normals).copy()
+    radial = points.astype(np.float64) - points.mean(axis=0)
+    lengths = np.linalg.norm(normals, axis=1)
+    missing = lengths <= 1e-12
+    normals[missing] = radial[missing]
+    lengths = np.linalg.norm(normals, axis=1)
+    normals[lengths <= 1e-12] = (0.0, 0.0, 1.0)
+    normals /= np.linalg.norm(normals, axis=1, keepdims=True)
+    normals[np.sum(normals * radial, axis=1) < 0] *= -1
+    return normals
+
+
+def generate_nature3d_pseudo_anomaly(points, rng, config=None, normals=None):
+    """Make one spherical, normal directed deformation using Nature3D-AD proportions."""
+    source = np.asarray(points)
+    if source.ndim != 2 or source.shape[1] != 3 or len(source) == 0:
+        raise ValueError('points must have shape [N, 3] with at least one point.')
+    config = {} if config is None else config
+    part_num = int(config.get('part_num', 96))
+    if part_num <= 0:
+        raise ValueError('part_num must be positive.')
+    distance_range = config.get('distance_range', (0.06, 0.08))
+    coord = source.astype(np.float64)
+    if normals is None:
+        normals = estimate_nature3d_normals(coord)
+    normals = np.asarray(normals, dtype=np.float64)
+    if normals.shape != coord.shape:
+        raise ValueError('normals must have shape [N, 3].')
+
+    center_index = int(rng.integers(len(coord))) if hasattr(rng, 'integers') else int(rng.randint(len(coord)))
+    center = coord[center_index]
+    tree = cKDTree(coord)
+    neighbor_count = min(len(coord), max(1, len(coord) // part_num))
+    distances, _ = tree.query(center, k=neighbor_count)
+    radius = float(np.atleast_1d(distances)[-1])
+    region_indices = np.asarray(tree.query_ball_point(center, radius), dtype=np.int64)
+    region_distances = np.linalg.norm(coord[region_indices] - center, axis=1)
+    if region_distances.max() > 0:
+        movement_ratio = 1.0 - region_distances / region_distances.max()
+    else:
+        movement_ratio = np.ones_like(region_distances)
+
+    # Nature3D-AD normalizes the whole cloud to a unit sphere before displacement.
+    unit_sphere_radius = float(np.linalg.norm(coord - coord.mean(axis=0), axis=1).max())
+    maximum_displacement = float(rng.uniform(*distance_range)) * unit_sphere_radius
+    direction = int(rng.choice((-1, 1)))
+    movements = direction * maximum_displacement * movement_ratio
+    changed = coord.copy()
+    changed[region_indices] += normals[region_indices] * movements[:, None]
+    mask = np.zeros(len(coord), dtype=np.uint8)
+    mask[region_indices] = 1
+    changed_points = changed.astype(source.dtype if np.issubdtype(source.dtype, np.floating) else np.float64,
+                                    copy=False)
+    metadata = {'type': 'nature3d', 'center': center.tolist(),
+                'radius': radius,
+                'max_displacement': float(np.linalg.norm(changed_points.astype(np.float64) - coord, axis=1).max())}
+    return changed_points, mask, metadata

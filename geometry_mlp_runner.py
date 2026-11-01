@@ -6,7 +6,10 @@ import torch
 from sklearn.metrics import average_precision_score
 from torch.utils.data import DataLoader, TensorDataset
 
-from data.pseudo_anomaly import generate_pseudo_anomaly
+from data.pseudo_anomaly import (
+    estimate_nature3d_normals, generate_nature3d_pseudo_anomaly,
+    generate_pseudo_anomaly,
+)
 from data.real3d import get_real_loader, real3d_classes
 from feature_extractors.FPFH import FPFHFeatures
 from feature_extractors.geometry_features import build_group_labels
@@ -59,10 +62,17 @@ def _collect_examples(args, extractor, samples, normals, statistics, rng, count)
     labels, weights = [], []
     for pc, normal in zip(samples, normals):
         normal_features = _normalized(normal, statistics)
+        points = pc.squeeze(0).numpy()
+        point_normals = (estimate_nature3d_normals(points)
+                         if args.pseudo_generator == 'nature3d' else None)
         for index in range(count):
-            anomaly_type = ('bump', 'dent', 'scratch')[index % 3]
-            changed, point_mask, _ = generate_pseudo_anomaly(
-                pc.squeeze(0).numpy(), anomaly_type, rng, config={})
+            if args.pseudo_generator == 'custom':
+                anomaly_type = ('bump', 'dent', 'scratch')[index % 3]
+                changed, point_mask, _ = generate_pseudo_anomaly(
+                    points, anomaly_type, rng, config={})
+            else:
+                changed, point_mask, _ = generate_nature3d_pseudo_anomaly(
+                    points, rng, normals=point_normals)
             pseudo = _extract(extractor, torch.from_numpy(changed).unsqueeze(0),
                               center_idx=normal['center_idx'])
             group_labels, ratios = build_group_labels(point_mask, pseudo['knn_idx'])
@@ -131,7 +141,7 @@ def _nearest_bank_scores(embedding, bank, chunk_size=256):
 
 
 def train_geometry_mlp(args):
-    if args.pseudo_per_sample < 3:
+    if args.pseudo_generator == 'custom' and args.pseudo_per_sample < 3:
         raise ValueError('--pseudo_per_sample must be at least 3 to include every anomaly type.')
     torch.manual_seed(args.geom_seed)
     np.random.seed(args.geom_seed)
@@ -196,7 +206,8 @@ def train_geometry_mlp(args):
                          'use_curvature': args.geom_use_curvature},
         'training_config': {'epochs': args.geom_epochs, 'batch_size': args.geom_batch_size,
                             'lr': args.geom_lr, 'seed': args.geom_seed,
-                            'pseudo_per_sample': args.pseudo_per_sample},
+                            'pseudo_per_sample': args.pseudo_per_sample,
+                            'pseudo_generator': args.pseudo_generator},
         'validation_loss': best_loss,
     }, checkpoint_path)
     print(f'Saved shared geometry MLP checkpoint: {checkpoint_path}')
