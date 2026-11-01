@@ -25,6 +25,24 @@ _FEATURE_KEYS = ('geometry', 'position', 'curvature')
 _EXTRACTION_KEYS = ('num_group', 'group_size', 'max_nn', 'use_MSND',
                     'num_MSND', 'msnd_impl', 'curvature_k')
 _CACHE_VERSION = 1
+_SOURCE_FINGERPRINT_CACHE = {}
+
+
+def _source_fingerprint(kind):
+    sources = {
+        'pseudo': ('data/pseudo_anomaly.py',),
+        'feature': ('feature_extractors/FPFH.py',
+                    'feature_extractors/geometry_features.py', 'data/real3d.py'),
+    }
+    if kind not in sources:
+        raise ValueError(f'Unknown source fingerprint kind: {kind}')
+    if kind not in _SOURCE_FINGERPRINT_CACHE:
+        root = Path(__file__).resolve().parent
+        _SOURCE_FINGERPRINT_CACHE[kind] = {
+            name: hashlib.sha256((root / name).read_bytes()).hexdigest()
+            for name in sources[kind]
+        }
+    return _SOURCE_FINGERPRINT_CACHE[kind]
 
 
 def _loader(args, split, category):
@@ -80,6 +98,9 @@ def _make_cache_key(points, sample_id, category, split, anomaly_index, generator
         'generator': generator,
         'generator_config': generator_config,
         'seed': int(seed),
+        'source_fingerprint': _source_fingerprint(
+            'feature' if feature_config is not None else 'pseudo'
+        ),
     }
     if feature_config is not None:
         payload['feature_config'] = feature_config
@@ -395,6 +416,7 @@ def train_geometry_mlp(args):
     torch.manual_seed(args.geom_seed)
     train_samples, validation_samples = [], []
     train_ids, validation_ids = [], []
+    train_cache_keys, validation_cache_keys = [], []
     train_normals, validation_normals = [], []
     normal_groups_by_category = {}
     normal_samples_by_category = {}
@@ -441,10 +463,12 @@ def train_geometry_mlp(args):
                     validation_samples.append(pc)
                     validation_normals.append(group)
                     validation_ids.append(sample_id)
+                    validation_cache_keys.append(group_key)
                 else:
                     train_samples.append(pc)
                     train_normals.append(group)
                     train_ids.append(sample_id)
+                    train_cache_keys.append(group_key)
             normal_groups_by_category[category] = groups
     statistics = _normalization(train_normals)
     train_data = _collect_examples(args, extractor, train_samples, train_normals,
@@ -461,15 +485,134 @@ def train_geometry_mlp(args):
     model = GeometryFusionMLP(feature_dim, use_position=args.geom_use_position,
                               use_curvature=args.geom_use_curvature).to(args.device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.geom_lr)
+    checkpoint_path = Path(args.geom_checkpoint)
+    resume_path = checkpoint_path.with_name(f'{checkpoint_path.stem}.resume.pt')
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    resume_model_config = {
+        'feature_dim': feature_dim,
+        'hidden_dim': 64,
+        'use_position': args.geom_use_position,
+        'use_curvature': args.geom_use_curvature,
+        'model_source_sha256': hashlib.sha256(
+            (Path(__file__).resolve().parent / 'feature_extractors' /
+             'geometry_mlp.py').read_bytes()
+        ).hexdigest(),
+        'state_shapes': {name: tuple(value.shape)
+                         for name, value in model.state_dict().items()},
+    }
+    resume_training_config = {
+        'optimizer': 'Adam',
+        'batch_size': args.geom_batch_size,
+        'lr': args.geom_lr,
+        'seed': args.geom_seed,
+        'pseudo_per_sample': args.pseudo_per_sample,
+        'pseudo_generator': args.pseudo_generator,
+        'device': str(args.device),
+    }
+    resume_data_config = {
+        'dataset': args.dataset,
+        'feature': args.feature,
+        'agg_method': args.agg_method,
+        'real3d_format': args.real3d_format,
+        'real3d_root': args.real3d_root,
+        'train_ids': train_ids,
+        'validation_ids': validation_ids,
+        'train_cache_keys': train_cache_keys,
+        'validation_cache_keys': validation_cache_keys,
+        'feature_config': feature_config,
+        'pseudo_generator_config': (
+            {'part_num': 96, 'distance_range': [0.06, 0.08]}
+            if args.pseudo_generator == 'nature3d' else
+            {'anomaly_types': ['bump', 'dent', 'scratch'],
+             'scale_probabilities': [0.7, 0.2, 0.1]}
+        ),
+        'pseudo_source_fingerprint': _source_fingerprint('pseudo'),
+        'feature_source_fingerprint': _source_fingerprint('feature'),
+    }
     best_loss = float('inf')
     best_state = None
-    for epoch in range(args.geom_epochs):
+    start_epoch = 0
+    if args.geom_resume and resume_path.exists():
+        resume = torch.load(resume_path, map_location='cpu')
+        if (not isinstance(resume, dict)
+                or resume.get('resume_format') != 'geometry_mlp_training_v1'
+                or resume.get('model_config') != resume_model_config
+                or resume.get('training_config') != resume_training_config
+                or resume.get('data_config') != resume_data_config):
+            raise ValueError(
+                f'Training resume configuration does not match: {resume_path}'
+            )
+        required = ('epoch', 'model_state', 'optimizer_state', 'best_loss',
+                    'best_model_state', 'torch_rng_state', 'cuda_rng_state',
+                    'numpy_rng_state', 'split_rng_state', 'validation_rng_state')
+        if any(key not in resume for key in required):
+            raise ValueError(f'Incomplete training resume checkpoint: {resume_path}')
+        start_epoch = int(resume['epoch'])
+        if start_epoch < 0 or start_epoch > args.geom_epochs:
+            raise ValueError(
+                f'Completed epoch {start_epoch} exceeds target --geom_epochs={args.geom_epochs}.'
+            )
+        model.load_state_dict(resume['model_state'])
+        optimizer.load_state_dict(resume['optimizer_state'])
+        best_loss = float(resume['best_loss'])
+        best_state = copy.deepcopy(resume['best_model_state'])
+        if best_state is None and start_epoch > 0:
+            raise ValueError(f'Resume checkpoint has no best model state: {resume_path}')
+        saved_cuda = resume['cuda_rng_state']
+        if saved_cuda is not None:
+            if not torch.cuda.is_available() or len(saved_cuda) != torch.cuda.device_count():
+                raise ValueError('CUDA device configuration differs from the training resume checkpoint.')
+            torch.cuda.set_rng_state_all(saved_cuda)
+        torch.set_rng_state(resume['torch_rng_state'])
+        numpy_state = resume['numpy_rng_state']
+        np.random.set_state((
+            numpy_state[0], np.asarray(numpy_state[1], dtype=np.uint32),
+            numpy_state[2], numpy_state[3], numpy_state[4]
+        ))
+        rng.bit_generator.state = copy.deepcopy(resume['split_rng_state'])
+        validation_rng.bit_generator.state = copy.deepcopy(resume['validation_rng_state'])
+        print(f'Resuming geometry MLP after epoch {start_epoch}: {resume_path}')
+    for epoch in range(start_epoch, args.geom_epochs):
         training_loss = _epoch(model, train_loader, args.device, optimizer)
         validation_loss = _epoch(model, validation_loader, args.device)
         print(f'Epoch {epoch + 1}: train loss {training_loss:.6f}, validation loss {validation_loss:.6f}')
         if validation_loss < best_loss:
             best_loss = validation_loss
             best_state = copy.deepcopy(model.state_dict())
+        numpy_state = np.random.get_state()
+        resume_state = {
+            'resume_format': 'geometry_mlp_training_v1',
+            'epoch': epoch + 1,
+            'model_state': model.state_dict(),
+            'optimizer_state': optimizer.state_dict(),
+            'best_loss': best_loss,
+            'best_model_state': best_state,
+            'model_config': resume_model_config,
+            'training_config': resume_training_config,
+            'data_config': resume_data_config,
+            'torch_rng_state': torch.get_rng_state(),
+            'cuda_rng_state': (torch.cuda.get_rng_state_all()
+                               if torch.cuda.is_available() else None),
+            'numpy_rng_state': (
+                numpy_state[0], numpy_state[1].tolist(),
+                numpy_state[2], numpy_state[3], numpy_state[4]
+            ),
+            'split_rng_state': copy.deepcopy(rng.bit_generator.state),
+            'validation_rng_state': copy.deepcopy(validation_rng.bit_generator.state),
+        }
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(mode='wb', suffix='.pt',
+                                             dir=resume_path.parent,
+                                             delete=False) as temporary:
+                temporary_path = Path(temporary.name)
+                torch.save(resume_state, temporary)
+                temporary.flush()
+                os.fsync(temporary.fileno())
+            os.replace(temporary_path, resume_path)
+        finally:
+            if temporary_path is not None and temporary_path.exists():
+                temporary_path.unlink()
     if best_state is None:
         raise ValueError('--geom_epochs must be positive.')
     model.load_state_dict(best_state)
@@ -479,8 +622,6 @@ def train_geometry_mlp(args):
                              for group in groups], dim=0)
         for category, groups in normal_groups_by_category.items()
     }
-    checkpoint_path = Path(args.geom_checkpoint)
-    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({
         'model_state': best_state,
         'memory_bank': memory_bank,
