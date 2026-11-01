@@ -28,10 +28,31 @@ def generate_pseudo_anomaly(points, anomaly_type, rng, config):
     angle = float(rng.uniform(0, 2 * np.pi))
     direction = np.cos(angle) * tangent + np.sin(angle) * tangent_other
     across = np.cross(normal, direction)
-    radius = max(scale * 2, diameter * float(rng.uniform(*config.get('area_range', (0.025, 0.10)))))
-    length = max(radius * 2, diameter * float(rng.uniform(*config.get('length_range', (0.06, 0.22)))))
-    width = max(scale * 1.5, radius * float(rng.uniform(0.35, 0.8)))
-    strength = max(scale, radius * float(rng.uniform(*config.get('strength_range', (0.15, 0.55)))))
+    scale_ranges = {
+        'micro': {'area': (0.004, 0.018), 'length': (0.015, 0.05),
+                  'strength': (0.05, 0.18), 'spacing': 1.5},
+        'small': {'area': (0.02, 0.05), 'length': (0.05, 0.12),
+                  'strength': (0.12, 0.35), 'spacing': 2.0},
+        'obvious': {'area': (0.05, 0.12), 'length': (0.12, 0.25),
+                    'strength': (0.20, 0.55), 'spacing': 3.0},
+    }
+    probabilities = np.asarray(config.get('scale_probabilities', (0.7, 0.2, 0.1)), dtype=float)
+    if probabilities.shape != (3,) or np.any(probabilities < 0) or not np.isclose(probabilities.sum(), 1):
+        raise ValueError('scale_probabilities must contain three nonnegative values summing to one.')
+    scale_level = config.get('scale_level')
+    if scale_level is None:
+        scale_level = rng.choice(tuple(scale_ranges), p=probabilities)
+    if scale_level not in scale_ranges:
+        raise ValueError(f'Unknown pseudo anomaly scale: {scale_level}')
+    ranges = scale_ranges[scale_level]
+    radius = max(scale * ranges['spacing'],
+                 diameter * float(rng.uniform(*config.get('area_range', ranges['area']))))
+    length = max(radius * 2,
+                 diameter * float(rng.uniform(*config.get('length_range', ranges['length']))))
+    width = max(scale * (0.6 if scale_level == 'micro' else 1.0),
+                radius * float(rng.uniform(0.3, 0.7)))
+    strength = max(scale * (0.3 if scale_level == 'micro' else 0.6),
+                   radius * float(rng.uniform(*config.get('strength_range', ranges['strength']))))
     offset = original - location
     along = offset @ direction
     sideways = offset @ across
@@ -46,7 +67,7 @@ def generate_pseudo_anomaly(points, anomaly_type, rng, config):
         displacement = (1 if anomaly_type == 'bump' else -1) * strength * profile * support
     mask = np.abs(displacement) > 0
     changed = original + displacement[:, None] * normal
-    metadata = {'type': anomaly_type, 'location': location.tolist(),
+    metadata = {'type': anomaly_type, 'scale_level': scale_level, 'location': location.tolist(),
                 'scale': {'radius': float(radius), 'length': float(length), 'width': float(width),
                           'spacing': spacing}, 'strength': float(strength),
                 'direction': direction.tolist()}

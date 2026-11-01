@@ -12,8 +12,6 @@ class GeometryFusionMLP(nn.Module):
         self.curvature_proj = nn.Sequential(nn.Linear(1, hidden_dim), nn.ReLU())
         self.gate = nn.Sequential(nn.Linear(3 * hidden_dim, hidden_dim), nn.ReLU(),
                                   nn.Linear(hidden_dim, 3))
-        self.classifier = nn.Sequential(nn.Linear(hidden_dim, hidden_dim // 2), nn.ReLU(),
-                                        nn.Linear(hidden_dim // 2, 1))
 
     def forward(self, geometry, position, curvature):
         geometry_feature = self.geometry_proj(geometry)
@@ -27,4 +25,4 @@ class GeometryFusionMLP(nn.Module):
         enabled = torch.tensor([True, self.use_position, self.use_curvature], device=geometry.device)
         weights = torch.softmax(gate_logits.masked_fill(~enabled, float('-inf')), dim=1)
         embedding = (branches * weights.unsqueeze(-1)).sum(dim=1) + geometry_feature
-        return self.classifier(embedding).squeeze(-1), embedding, weights
+        return embedding, weights

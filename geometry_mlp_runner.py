@@ -4,7 +4,6 @@ from pathlib import Path
 import numpy as np
 import torch
 from sklearn.metrics import average_precision_score
-from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from data.pseudo_anomaly import generate_pseudo_anomaly
@@ -55,7 +54,8 @@ def _normalized(group, statistics):
 
 
 def _collect_examples(args, extractor, samples, normals, statistics, rng, count):
-    features = [[] for _ in _FEATURE_KEYS]
+    normal_features_by_branch = [[] for _ in _FEATURE_KEYS]
+    pseudo_features_by_branch = [[] for _ in _FEATURE_KEYS]
     labels, weights = [], []
     for pc, normal in zip(samples, normals):
         normal_features = _normalized(normal, statistics)
@@ -67,34 +67,46 @@ def _collect_examples(args, extractor, samples, normals, statistics, rng, count)
                               center_idx=normal['center_idx'])
             group_labels, ratios = build_group_labels(point_mask, pseudo['knn_idx'])
             positive = torch.nonzero(group_labels > 0, as_tuple=True)[0].cpu()
-            if positive.numel() == 0:
+            negative = torch.nonzero(group_labels == 0, as_tuple=True)[0].cpu()
+            pair_count = min(positive.numel(), negative.numel())
+            if pair_count == 0:
                 continue
-            negative_count = min(positive.numel(), normal_features[0].shape[0])
-            negative = torch.from_numpy(rng.choice(normal_features[0].shape[0],
-                                                    size=negative_count, replace=False))
+            positive = torch.from_numpy(rng.choice(positive.numpy(), size=pair_count, replace=False))
+            negative = torch.from_numpy(rng.choice(negative.numpy(), size=pair_count, replace=False))
+            selected = torch.cat((negative, positive))
             pseudo_features = _normalized(pseudo, statistics)
-            for branch, normal_branch, pseudo_branch in zip(features, normal_features, pseudo_features):
-                branch.extend((normal_branch[negative], pseudo_branch[positive]))
-            labels.extend((torch.zeros(negative_count), torch.ones(positive.numel())))
-            weights.extend((torch.ones(negative_count),
-                            0.25 + 0.75 * ratios[positive.to(ratios.device)].detach().cpu()))
+            for normal_list, pseudo_list, normal_branch, pseudo_branch in zip(
+                    normal_features_by_branch, pseudo_features_by_branch,
+                    normal_features, pseudo_features):
+                normal_list.append(normal_branch[selected])
+                pseudo_list.append(pseudo_branch[selected])
+            labels.append(torch.cat((torch.zeros(pair_count), torch.ones(pair_count))))
+            weights.append(torch.cat((torch.ones(pair_count),
+                                      0.25 + 0.75 * ratios[positive].detach().cpu())))
     if not labels:
         raise ValueError('Pseudo anomalies produced no positive groups.')
-    return TensorDataset(*(torch.cat(branch) for branch in features),
+    return TensorDataset(*(torch.cat(branch) for branch in normal_features_by_branch),
+                         *(torch.cat(branch) for branch in pseudo_features_by_branch),
                          torch.cat(labels), torch.cat(weights))
 
 
 def _epoch(model, loader, device, optimizer=None):
     model.train(optimizer is not None)
     total_loss, total_weight = 0.0, 0
-    for geometry, position, curvature, labels, weights in loader:
-        geometry, position, curvature = (part.to(device) for part in
-                                          (geometry, position, curvature))
+    for normal_geometry, normal_position, normal_curvature, \
+            pseudo_geometry, pseudo_position, pseudo_curvature, labels, weights in loader:
+        normal_inputs = (part.to(device) for part in
+                         (normal_geometry, normal_position, normal_curvature))
+        pseudo_inputs = (part.to(device) for part in
+                         (pseudo_geometry, pseudo_position, pseudo_curvature))
         labels, weights = labels.to(device), weights.to(device)
         with torch.set_grad_enabled(optimizer is not None):
-            logits, _, _ = model(geometry, position, curvature)
-            loss = (nn.functional.binary_cross_entropy_with_logits(
-                logits, labels, reduction='none') * weights).mean()
+            normal_embedding, _ = model(*normal_inputs)
+            pseudo_embedding, _ = model(*pseudo_inputs)
+            distance = torch.linalg.vector_norm(normal_embedding - pseudo_embedding,
+                                                dim=1) / (normal_embedding.shape[1] ** 0.5)
+            pair_loss = (1 - labels) * distance.square() + labels * torch.relu(0.5 - distance).square()
+            loss = (pair_loss * weights).mean()
             if optimizer is not None:
                 optimizer.zero_grad()
                 loss.backward()
@@ -102,6 +114,20 @@ def _epoch(model, loader, device, optimizer=None):
         total_loss += loss.item() * labels.numel()
         total_weight += labels.numel()
     return total_loss / total_weight
+
+
+def _embedding(model, group, statistics, device):
+    inputs = (part.to(device) for part in _normalized(group, statistics))
+    with torch.no_grad():
+        embedding, _ = model(*inputs)
+    return embedding
+
+
+def _nearest_bank_scores(embedding, bank, chunk_size=256):
+    return torch.cat([
+        torch.cdist(embedding[start:start + chunk_size], bank).min(dim=1).values
+        for start in range(0, embedding.shape[0], chunk_size)
+    ])
 
 
 def train_geometry_mlp(args):
@@ -113,20 +139,21 @@ def train_geometry_mlp(args):
     extractor = FPFHFeatures(args=args)
     torch.manual_seed(args.geom_seed)
     train_samples, validation_samples = [], []
+    train_normals, validation_normals = [], []
+    normal_groups_by_category = {}
     for category in real3d_classes():
         samples = [pc for pc, _, label, _ in _loader(args, 'train', category)
                    if int(torch.as_tensor(label).reshape(-1)[0]) == 0]
-        if not samples:
-            raise ValueError(f'No normal training samples for {category}.')
-        if len(samples) > 1:
-            held_out = int(rng.integers(len(samples)))
-            validation_samples.append(samples.pop(held_out))
-        else:
-            validation_samples.append(samples[0])
-        train_samples.extend(samples)
-    train_normals = [_extract(extractor, pc) for pc in train_samples]
+        if len(samples) != 4:
+            raise ValueError(f'{category} requires four normal training samples; found {len(samples)}.')
+        groups = [_extract(extractor, pc) for pc in samples]
+        normal_groups_by_category[category] = groups
+        held_out = int(rng.integers(4))
+        validation_samples.append(samples[held_out])
+        validation_normals.append(groups[held_out])
+        train_samples.extend(pc for index, pc in enumerate(samples) if index != held_out)
+        train_normals.extend(group for index, group in enumerate(groups) if index != held_out)
     statistics = _normalization(train_normals)
-    validation_normals = [_extract(extractor, pc) for pc in validation_samples]
     train_data = _collect_examples(args, extractor, train_samples, train_normals,
                                    statistics, rng, args.pseudo_per_sample)
     validation_rng = np.random.default_rng(args.geom_seed + 1)
@@ -139,27 +166,39 @@ def train_geometry_mlp(args):
                               use_curvature=args.geom_use_curvature).to(args.device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.geom_lr)
     best_loss = float('inf')
-    checkpoint_path = Path(args.geom_checkpoint)
-    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    best_state = None
     for epoch in range(args.geom_epochs):
         training_loss = _epoch(model, train_loader, args.device, optimizer)
         validation_loss = _epoch(model, validation_loader, args.device)
         print(f'Epoch {epoch + 1}: train loss {training_loss:.6f}, validation loss {validation_loss:.6f}')
         if validation_loss < best_loss:
             best_loss = validation_loss
-            torch.save({
-                'model_state': model.state_dict(),
-                'normalization': statistics,
-                'feature_dim': feature_dim,
-                'hidden_dim': 64,
-                'feature_config': {key: getattr(args, key) for key in _EXTRACTION_KEYS},
-                'model_config': {'use_position': args.geom_use_position,
-                                 'use_curvature': args.geom_use_curvature},
-                'training_config': {'epochs': args.geom_epochs, 'batch_size': args.geom_batch_size,
-                                    'lr': args.geom_lr, 'seed': args.geom_seed,
-                                    'pseudo_per_sample': args.pseudo_per_sample},
-                'validation_loss': best_loss,
-            }, checkpoint_path)
+            best_state = copy.deepcopy(model.state_dict())
+    if best_state is None:
+        raise ValueError('--geom_epochs must be positive.')
+    model.load_state_dict(best_state)
+    model.eval()
+    memory_bank = {
+        category: torch.cat([_embedding(model, group, statistics, args.device).cpu()
+                             for group in groups], dim=0)
+        for category, groups in normal_groups_by_category.items()
+    }
+    checkpoint_path = Path(args.geom_checkpoint)
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({
+        'model_state': best_state,
+        'memory_bank': memory_bank,
+        'normalization': statistics,
+        'feature_dim': feature_dim,
+        'hidden_dim': 64,
+        'feature_config': {key: getattr(args, key) for key in _EXTRACTION_KEYS},
+        'model_config': {'use_position': args.geom_use_position,
+                         'use_curvature': args.geom_use_curvature},
+        'training_config': {'epochs': args.geom_epochs, 'batch_size': args.geom_batch_size,
+                            'lr': args.geom_lr, 'seed': args.geom_seed,
+                            'pseudo_per_sample': args.pseudo_per_sample},
+        'validation_loss': best_loss,
+    }, checkpoint_path)
     print(f'Saved shared geometry MLP checkpoint: {checkpoint_path}')
 
 
@@ -177,17 +216,15 @@ def evaluate_geometry_mlp(args):
     results = []
     for category in real3d_classes():
         extractor.init_para()
+        bank = checkpoint['memory_bank'][category].to(args.device)
         for pc, mask, label, path in _loader(args, 'test', category):
             group = _extract(extractor, pc)
-            geometry, position, curvature = (part.to(args.device) for part in
-                                              _normalized(group, statistics))
-            with torch.no_grad():
-                logits, _, _ = model(geometry, position, curvature)
-                scores = torch.sigmoid(logits)
-                extractor.compute_anomay_scores(
-                    group['features'], mask, label, path, pc.squeeze(0),
-                    group['points'].unsqueeze(0).to(args.device), group['center'].to(args.device),
-                    external_patch_scores=scores)
+            embedding = _embedding(model, group, statistics, args.device)
+            scores = _nearest_bank_scores(embedding, bank)
+            extractor.compute_anomay_scores(
+                group['features'], mask, label, path, pc.squeeze(0),
+                group['points'].unsqueeze(0).to(args.device), group['center'].to(args.device),
+                external_patch_scores=scores)
         pixel_labels = np.asarray(extractor.pixel_labels).reshape(-1)
         pixel_scores = np.asarray(extractor.pixel_preds).reshape(-1)
         p_aupr = (average_precision_score(pixel_labels, pixel_scores)
