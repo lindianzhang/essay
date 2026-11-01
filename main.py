@@ -199,7 +199,20 @@ if __name__ == '__main__':
         parser.add_argument('--agg_method', type=str, choices=['mean', 'ncrp'], default='mean',
                             help='mean: original Simple3D; ncrp: residual pooling (requires --use_LFSA True)')
         parser.add_argument('--detector', choices=['simple3d', 'geometry_mlp'], default='simple3d')
-        parser.add_argument('--geom_action', choices=['train', 'eval'], default=None)
+        parser.add_argument(
+            '--geom_action',
+            choices=['train', 'eval', 'diagnose'],
+            default=None
+        )
+        parser.add_argument(
+            '--diag_categories',
+            nargs='+',
+            default=['seahorse', 'shell', 'car', 'fish']
+        )
+        parser.add_argument('--diag_normal_count', type=int, default=2)
+        parser.add_argument('--diag_anomaly_count', type=int, default=2)
+        parser.add_argument('--diag_dir', type=str, default=None)
+        parser.add_argument('--diag_compare_baseline', type=parse_bool, default=True)
         parser.add_argument('--geom_checkpoint', type=str, default='geometry_mlp.pt')
         parser.add_argument('--geom_epochs', type=int, default=50)
         parser.add_argument('--geom_batch_size', type=int, default=256)
@@ -251,12 +264,15 @@ if __name__ == '__main__':
             if args.dataset != 'real' or args.feature != 'FPFH' or args.agg_method != 'mean' or not args.use_LFSA:
                 raise ValueError('geometry_mlp requires dataset=real, feature=FPFH, agg_method=mean, and use_LFSA=True.')
             if args.geom_action is None:
-                raise ValueError('geometry_mlp requires --geom_action train or eval.')
+                raise ValueError('geometry_mlp requires --geom_action train, eval, or diagnose.')
             from geometry_mlp_runner import train_geometry_mlp, evaluate_geometry_mlp
             if args.geom_action == 'train':
                 train_geometry_mlp(args)
-            else:
+            elif args.geom_action == 'eval':
                 evaluate_geometry_mlp(args)
+            else:
+                from geometry_diagnostics import run_geometry_diagnostics
+                run_geometry_diagnostics(args)
 
         print("=" * 80)
         print(f"[日志系统] 结束时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
