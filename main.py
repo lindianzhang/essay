@@ -221,6 +221,11 @@ if __name__ == '__main__':
         parser.add_argument('--curvature_k', type=int, default=32)
         parser.add_argument('--pseudo_per_sample', type=int, default=10)
         parser.add_argument(
+            '--pseudo_cache_dir',
+            type=str,
+            default=None
+        )
+        parser.add_argument(
             '--pseudo_generator',
             type=str,
             choices=['custom', 'nature3d'],

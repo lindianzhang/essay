@@ -1,10 +1,15 @@
 import copy
+import hashlib
+import json
+import os
+import tempfile
 from pathlib import Path
 
 import numpy as np
 import torch
 from sklearn.metrics import average_precision_score
 from torch.utils.data import DataLoader, TensorDataset
+from tqdm.auto import tqdm
 
 from data.pseudo_anomaly import (
     estimate_nature3d_normals, generate_nature3d_pseudo_anomaly,
@@ -19,6 +24,7 @@ from feature_extractors.geometry_mlp import GeometryFusionMLP
 _FEATURE_KEYS = ('geometry', 'position', 'curvature')
 _EXTRACTION_KEYS = ('num_group', 'group_size', 'max_nn', 'use_MSND',
                     'num_MSND', 'msnd_impl', 'curvature_k')
+_CACHE_VERSION = 1
 
 
 def _loader(args, split, category):
@@ -56,43 +62,277 @@ def _normalized(group, statistics):
             for key in _FEATURE_KEYS]
 
 
-def _collect_examples(args, extractor, samples, normals, statistics, rng, count):
+def _make_cache_key(points, sample_id, category, split, anomaly_index, generator,
+                    generator_config, seed, feature_config=None, feature_points=None,
+                    center_idx=None):
+    def array_digest(values):
+        array = np.ascontiguousarray(values)
+        digest = hashlib.sha256(array.tobytes()).hexdigest()
+        return {'sha256': digest, 'shape': list(array.shape), 'dtype': str(array.dtype)}
+
+    payload = {
+        'version': _CACHE_VERSION,
+        'source_path': str(sample_id),
+        'source_points': array_digest(points),
+        'category': category,
+        'split': split,
+        'anomaly_index': anomaly_index,
+        'generator': generator,
+        'generator_config': generator_config,
+        'seed': int(seed),
+    }
+    if feature_config is not None:
+        payload['feature_config'] = feature_config
+        payload['feature_points'] = array_digest(
+            points if feature_points is None else feature_points
+        )
+        payload['fixed_center_idx'] = (
+            None if center_idx is None else array_digest(
+                torch.as_tensor(center_idx).detach().cpu().numpy()
+            )
+        )
+    encoded = json.dumps(payload, sort_keys=True, separators=(',', ':'),
+                         ensure_ascii=False).encode('utf-8')
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _load_or_generate_pseudo(points, sample_id, anomaly_index, seed, normals,
+                             cache_path, generator='nature3d', generator_config=None,
+                             cache_status=None):
+    cache_path = Path(cache_path)
+    generator_config = {} if generator_config is None else generator_config
+    serialized_config = json.dumps(generator_config, sort_keys=True,
+                                   separators=(',', ':'))
+    if cache_status is not None:
+        cache_status['hit'] = False
+    if cache_path.exists():
+        try:
+            with np.load(cache_path, allow_pickle=False) as cached:
+                if (str(cached['cache_key'].item()) != cache_path.stem
+                        or int(cached['cache_version'].item()) != _CACHE_VERSION
+                        or str(cached['sample_id'].item()) != str(sample_id)
+                        or int(cached['anomaly_index'].item()) != anomaly_index
+                        or int(cached['seed'].item()) != seed
+                        or str(cached['generator'].item()) != generator
+                        or str(cached['generator_config'].item()) != serialized_config):
+                    raise ValueError('Pseudo cache identity differs from the request.')
+                changed = cached['changed_points'].copy()
+                point_mask = cached['point_mask'].copy()
+                metadata = json.loads(str(cached['metadata'].item()))
+                if (changed.shape != points.shape or point_mask.shape != (len(points),)
+                        or changed.dtype != np.asarray(points).dtype
+                        or not np.isfinite(changed).all()
+                        or not np.isin(point_mask, (0, 1)).all()
+                        or not isinstance(metadata, dict)):
+                    raise ValueError('Pseudo cache content has invalid dimensions or values.')
+            if cache_status is not None:
+                cache_status['hit'] = True
+            return changed, point_mask, metadata
+        except Exception:
+            pass  # Regenerate only this missing or damaged cache entry.
+
+    item_rng = np.random.default_rng(seed)
+    if generator == 'nature3d':
+        if normals is None:
+            normals = {}
+        if 'values' not in normals:
+            normals['values'] = estimate_nature3d_normals(points)
+        changed, point_mask, metadata = generate_nature3d_pseudo_anomaly(
+            points, item_rng, config=generator_config, normals=normals['values']
+        )
+    elif generator == 'custom':
+        anomaly_type = generator_config['anomaly_type']
+        changed, point_mask, metadata = generate_pseudo_anomaly(
+            points, anomaly_type, item_rng, config=generator_config.get('parameters', {})
+        )
+    else:
+        raise ValueError(f'Unknown pseudo generator: {generator}')
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='wb', suffix='.npz',
+                                         dir=cache_path.parent, delete=False) as temporary:
+            temporary_path = Path(temporary.name)
+            np.savez_compressed(
+                temporary, changed_points=changed, point_mask=point_mask,
+                metadata=json.dumps(metadata, ensure_ascii=False, default=str),
+                cache_key=cache_path.stem, cache_version=_CACHE_VERSION,
+                sample_id=str(sample_id), anomaly_index=anomaly_index,
+                seed=seed, generator=generator, generator_config=serialized_config
+            )
+        os.replace(temporary_path, cache_path)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
+    return changed, point_mask, metadata
+
+
+def _load_or_extract_group(pc, extractor, cache_key, center_idx=None, cache_status=None):
+    args = extractor.args
+    cache_path = Path(args.pseudo_cache_dir) / 'features' / f'{cache_key}.pt'
+    feature_config = {key: getattr(args, key) for key in _EXTRACTION_KEYS}
+    feature_config['use_LFSA'] = args.use_LFSA
+    expected_points = pc.squeeze(0).detach().cpu().to(torch.float32)
+    group_count = args.num_group
+    point_count = expected_points.shape[0]
+    required = ('features', 'positions', 'curvature', 'center_idx',
+                'knn_idx', 'points', 'center')
+    if cache_status is not None:
+        cache_status['hit'] = False
+    if cache_path.exists():
+        try:
+            cached = torch.load(cache_path, map_location='cpu')
+            group = cached['group']
+            if (cached['cache_key'] != cache_key
+                    or cached['cache_version'] != _CACHE_VERSION
+                    or cached['feature_config'] != feature_config
+                    or set(group) != set(required)
+                    or not all(isinstance(group[key], torch.Tensor)
+                               and group[key].device.type == 'cpu' for key in required)
+                    or group['features'].ndim != 2
+                    or group['features'].shape[0] != group_count
+                    or group['features'].shape[1] == 0
+                    or group['positions'].shape != (group_count, 3)
+                    or group['curvature'].shape != (group_count, 1)
+                    or group['center_idx'].shape != (group_count,)
+                    or group['knn_idx'].shape != (group_count, args.group_size)
+                    or group['points'].shape != (point_count, 3)
+                    or group['center'].shape != (1, group_count, 3)
+                    or not torch.equal(group['points'], expected_points)
+                    or torch.any(group['center_idx'] < 0)
+                    or torch.any(group['center_idx'] >= point_count)
+                    or torch.any(group['knn_idx'] < 0)
+                    or torch.any(group['knn_idx'] >= point_count)
+                    or not torch.equal(
+                        group['center'].squeeze(0),
+                        group['points'][group['center_idx'].long()]
+                    )
+                    or (center_idx is not None and not torch.equal(
+                        group['center_idx'].long(), center_idx.detach().cpu().long()
+                    ))):
+                raise ValueError('Feature cache content or configuration differs from the request.')
+            if cache_status is not None:
+                cache_status['hit'] = True
+            return group
+        except Exception:
+            pass  # Regenerate only this missing or damaged cache entry.
+
+    group = _extract(extractor, pc, center_idx=center_idx)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='wb', suffix='.pt',
+                                         dir=cache_path.parent, delete=False) as temporary:
+            temporary_path = Path(temporary.name)
+            torch.save({'cache_key': cache_key, 'cache_version': _CACHE_VERSION,
+                        'feature_config': feature_config, 'group': group}, temporary)
+        os.replace(temporary_path, cache_path)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
+    return group
+
+
+def _collect_examples(args, extractor, samples, normals, statistics, rng, count,
+                      sample_ids, split, progress_desc):
+    if len(samples) != len(normals) or len(samples) != len(sample_ids):
+        raise ValueError('samples, normals, and sample_ids must correspond one-to-one.')
     normal_features_by_branch = [[] for _ in _FEATURE_KEYS]
     pseudo_features_by_branch = [[] for _ in _FEATURE_KEYS]
     labels, weights = [], []
-    for pc, normal in zip(samples, normals):
-        normal_features = _normalized(normal, statistics)
-        points = pc.squeeze(0).numpy()
-        point_normals = (estimate_nature3d_normals(points)
-                         if args.pseudo_generator == 'nature3d' else None)
-        for index in range(count):
-            if args.pseudo_generator == 'custom':
-                anomaly_type = ('bump', 'dent', 'scratch')[index % 3]
-                changed, point_mask, _ = generate_pseudo_anomaly(
-                    points, anomaly_type, rng, config={})
-            else:
-                changed, point_mask, _ = generate_nature3d_pseudo_anomaly(
-                    points, rng, normals=point_normals)
-            pseudo = _extract(extractor, torch.from_numpy(changed).unsqueeze(0),
-                              center_idx=normal['center_idx'])
-            group_labels, ratios = build_group_labels(point_mask, pseudo['knn_idx'])
-            positive = torch.nonzero(group_labels > 0, as_tuple=True)[0].cpu()
-            negative = torch.nonzero(group_labels == 0, as_tuple=True)[0].cpu()
-            pair_count = min(positive.numel(), negative.numel())
-            if pair_count == 0:
-                continue
-            positive = torch.from_numpy(rng.choice(positive.numpy(), size=pair_count, replace=False))
-            negative = torch.from_numpy(rng.choice(negative.numpy(), size=pair_count, replace=False))
-            selected = torch.cat((negative, positive))
-            pseudo_features = _normalized(pseudo, statistics)
-            for normal_list, pseudo_list, normal_branch, pseudo_branch in zip(
-                    normal_features_by_branch, pseudo_features_by_branch,
-                    normal_features, pseudo_features):
-                normal_list.append(normal_branch[selected])
-                pseudo_list.append(pseudo_branch[selected])
-            labels.append(torch.cat((torch.zeros(pair_count), torch.ones(pair_count))))
-            weights.append(torch.cat((torch.ones(pair_count),
-                                      0.25 + 0.75 * ratios[positive].detach().cpu())))
+    cache_root = Path(args.pseudo_cache_dir)
+    feature_config = {key: getattr(args, key) for key in _EXTRACTION_KEYS}
+    feature_config['use_LFSA'] = args.use_LFSA
+    cache_hit = generated = 0
+    with tqdm(total=len(samples) * count, desc=progress_desc,
+              dynamic_ncols=True, unit='anomaly') as progress:
+        for sample_number, (pc, normal, sample_id) in enumerate(
+                zip(samples, normals, sample_ids), start=1):
+            normal_features = _normalized(normal, statistics)
+            points = pc.squeeze(0).numpy()
+            category = Path(sample_id).parent.parent.name
+            normal_cache = {}
+            for index in range(count):
+                seed_input = json.dumps(
+                    [str(sample_id), index, int(args.geom_seed)],
+                    ensure_ascii=False, separators=(',', ':')
+                ).encode('utf-8')
+                item_seed = int.from_bytes(
+                    hashlib.sha256(seed_input).digest()[:8], 'big'
+                )
+                sampling_seed = int.from_bytes(
+                    hashlib.sha256(seed_input + b':sampling').digest()[:8], 'big'
+                )
+                sampling_rng = np.random.default_rng(sampling_seed)
+                if args.pseudo_generator == 'custom':
+                    generator_config = {
+                        'anomaly_type': ('bump', 'dent', 'scratch')[index % 3],
+                        'parameters': {},
+                    }
+                else:
+                    generator_config = {
+                        'part_num': 96, 'distance_range': [0.06, 0.08]
+                    }
+                pseudo_key = _make_cache_key(
+                    points, sample_id, category, split, index,
+                    args.pseudo_generator, generator_config, item_seed
+                )
+                pseudo_path = cache_root / 'pseudo' / f'{pseudo_key}.npz'
+                progress.set_postfix(
+                    category=category, sample=f'{sample_number}/{len(samples)}',
+                    cache_hit=cache_hit, generated=generated, refresh=True
+                )
+                progress.refresh()
+                pseudo_status = {}
+                changed, point_mask, _ = _load_or_generate_pseudo(
+                    points, sample_id, index, item_seed, normal_cache, pseudo_path,
+                    generator=args.pseudo_generator,
+                    generator_config=generator_config, cache_status=pseudo_status
+                )
+                group_key = _make_cache_key(
+                    points, sample_id, category, split, index,
+                    args.pseudo_generator, generator_config, item_seed,
+                    feature_config=feature_config, feature_points=changed,
+                    center_idx=normal['center_idx']
+                )
+                progress.refresh()  # Show the current item before feature extraction.
+                feature_status = {}
+                pseudo = _load_or_extract_group(
+                    torch.from_numpy(changed).unsqueeze(0), extractor, group_key,
+                    center_idx=normal['center_idx'], cache_status=feature_status
+                )
+                if pseudo_status['hit'] and feature_status['hit']:
+                    cache_hit += 1
+                else:
+                    generated += 1
+                progress.set_postfix(
+                    category=category, sample=f'{sample_number}/{len(samples)}',
+                    cache_hit=cache_hit, generated=generated, refresh=True
+                )
+                progress.update(1)
+                group_labels, ratios = build_group_labels(point_mask, pseudo['knn_idx'])
+                positive = torch.nonzero(group_labels > 0, as_tuple=True)[0].cpu()
+                negative = torch.nonzero(group_labels == 0, as_tuple=True)[0].cpu()
+                pair_count = min(positive.numel(), negative.numel())
+                if pair_count == 0:
+                    continue
+                positive = torch.from_numpy(sampling_rng.choice(
+                    positive.numpy(), size=pair_count, replace=False
+                ))
+                negative = torch.from_numpy(sampling_rng.choice(
+                    negative.numpy(), size=pair_count, replace=False
+                ))
+                selected = torch.cat((negative, positive))
+                pseudo_features = _normalized(pseudo, statistics)
+                for normal_list, pseudo_list, normal_branch, pseudo_branch in zip(
+                        normal_features_by_branch, pseudo_features_by_branch,
+                        normal_features, pseudo_features):
+                    normal_list.append(normal_branch[selected])
+                    pseudo_list.append(pseudo_branch[selected])
+                labels.append(torch.cat((torch.zeros(pair_count), torch.ones(pair_count))))
+                weights.append(torch.cat((torch.ones(pair_count),
+                                          0.25 + 0.75 * ratios[positive].detach().cpu())))
     if not labels:
         raise ValueError('Pseudo anomalies produced no positive groups.')
     return TensorDataset(*(torch.cat(branch) for branch in normal_features_by_branch),
@@ -143,32 +383,78 @@ def _nearest_bank_scores(embedding, bank, chunk_size=256):
 def train_geometry_mlp(args):
     if args.pseudo_generator == 'custom' and args.pseudo_per_sample < 3:
         raise ValueError('--pseudo_per_sample must be at least 3 to include every anomaly type.')
+    if args.pseudo_cache_dir is None:
+        args.pseudo_cache_dir = str(
+            Path('/root/autodl-fs/real3d_pseudo_cache') if os.name == 'posix'
+            else Path(__file__).resolve().parent / 'pseudo_cache'
+        )
     torch.manual_seed(args.geom_seed)
     np.random.seed(args.geom_seed)
     rng = np.random.default_rng(args.geom_seed)
     extractor = FPFHFeatures(args=args)
     torch.manual_seed(args.geom_seed)
     train_samples, validation_samples = [], []
+    train_ids, validation_ids = [], []
     train_normals, validation_normals = [], []
     normal_groups_by_category = {}
+    normal_samples_by_category = {}
     for category in real3d_classes():
-        samples = [pc for pc, _, label, _ in _loader(args, 'train', category)
-                   if int(torch.as_tensor(label).reshape(-1)[0]) == 0]
+        samples = [
+            (pc, str(path[0] if isinstance(path, (tuple, list)) else path))
+            for pc, _, label, path in _loader(args, 'train', category)
+            if int(torch.as_tensor(label).reshape(-1)[0]) == 0
+        ]
         if len(samples) != 4:
             raise ValueError(f'{category} requires four normal training samples; found {len(samples)}.')
-        groups = [_extract(extractor, pc) for pc in samples]
-        normal_groups_by_category[category] = groups
-        held_out = int(rng.integers(4))
-        validation_samples.append(samples[held_out])
-        validation_normals.append(groups[held_out])
-        train_samples.extend(pc for index, pc in enumerate(samples) if index != held_out)
-        train_normals.extend(group for index, group in enumerate(groups) if index != held_out)
+        normal_samples_by_category[category] = samples
+    feature_config = {key: getattr(args, key) for key in _EXTRACTION_KEYS}
+    feature_config['use_LFSA'] = args.use_LFSA
+    normal_count = sum(len(samples) for samples in normal_samples_by_category.values())
+    with tqdm(total=normal_count, desc='Normal feature extraction',
+              dynamic_ncols=True, unit='sample') as normal_progress:
+        for category, samples in normal_samples_by_category.items():
+            held_out = int(rng.integers(4))
+            groups = []
+            for index, (pc, sample_id) in enumerate(samples):
+                split = 'validation' if index == held_out else 'train'
+                points = pc.squeeze(0).numpy()
+                generator_config = (
+                    {'part_num': 96, 'distance_range': [0.06, 0.08]}
+                    if args.pseudo_generator == 'nature3d' else
+                    {'anomaly_types': ['bump', 'dent', 'scratch'],
+                     'scale_probabilities': [0.7, 0.2, 0.1]}
+                )
+                group_key = _make_cache_key(
+                    points, sample_id, category, split, None,
+                    args.pseudo_generator, generator_config, args.geom_seed,
+                    feature_config=feature_config
+                )
+                normal_progress.set_postfix(
+                    category=category, sample=f'{index + 1}/{len(samples)}',
+                    refresh=True
+                )
+                normal_progress.refresh()
+                group = _load_or_extract_group(pc, extractor, group_key)
+                groups.append(group)
+                normal_progress.update(1)
+                if index == held_out:
+                    validation_samples.append(pc)
+                    validation_normals.append(group)
+                    validation_ids.append(sample_id)
+                else:
+                    train_samples.append(pc)
+                    train_normals.append(group)
+                    train_ids.append(sample_id)
+            normal_groups_by_category[category] = groups
     statistics = _normalization(train_normals)
     train_data = _collect_examples(args, extractor, train_samples, train_normals,
-                                   statistics, rng, args.pseudo_per_sample)
+                                   statistics, rng, args.pseudo_per_sample,
+                                   train_ids, 'train', 'Training pseudo anomalies')
     validation_rng = np.random.default_rng(args.geom_seed + 1)
     validation_data = _collect_examples(args, extractor, validation_samples,
-                                        validation_normals, statistics, validation_rng, 3)
+                                        validation_normals, statistics, validation_rng, 3,
+                                        validation_ids, 'validation',
+                                        'Validation pseudo anomalies')
     train_loader = DataLoader(train_data, batch_size=args.geom_batch_size, shuffle=True)
     validation_loader = DataLoader(validation_data, batch_size=args.geom_batch_size)
     feature_dim = train_normals[0]['features'].shape[1]
