@@ -4,6 +4,7 @@ import numpy as np
 import torch
 from feature_extractors.features import *
 from feature_extractors.pointnet2_utils import *
+from feature_extractors.geometry_features import estimate_patch_curvature, normalize_patch_positions
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -53,7 +54,7 @@ class FPFHFeatures(Features):
         super().__init__(args = args)
 
 
-    def get_fpfh_features(self,unorganized_pc, voxel_size=0.1):
+    def get_fpfh_features(self,unorganized_pc, voxel_size=0.1, return_group_info=False, fixed_center_idx=None):
         if getattr(self.args, 'agg_method', 'mean') == 'ncrp' and not self.args.use_LFSA:
             raise ValueError('NCRP requires use_LFSA=True; use the same setting for Mean ablations.')
         # unorganized_pc:(1,n,3)--> (n,3)
@@ -102,7 +103,21 @@ class FPFHFeatures(Features):
         unorganized_pc_no_zeros = unorganized_pc_no_zeros.to(torch.float32)
         # unorganized_pc_no_zeros expected (1,n,3)
         batch_size, num_points, _ = unorganized_pc_no_zeros.contiguous().shape
-        center, center_idx = fps(unorganized_pc_no_zeros.contiguous(), self.args.num_group)  # B G 3
+        if fixed_center_idx is None:
+            center, center_idx = fps(unorganized_pc_no_zeros.contiguous(), self.args.num_group)  # B G 3
+        else:
+            if not isinstance(fixed_center_idx, torch.Tensor):
+                raise TypeError('fixed_center_idx must be a torch.Tensor.')
+            if fixed_center_idx.device != unorganized_pc_no_zeros.device:
+                raise ValueError('fixed_center_idx must be on the point cloud device.')
+            if fixed_center_idx.ndim != 1 or fixed_center_idx.shape[0] != self.args.num_group:
+                raise ValueError('fixed_center_idx must have shape [num_group].')
+            if fixed_center_idx.dtype not in (torch.int32, torch.int64):
+                raise TypeError('fixed_center_idx must contain integer indices.')
+            if torch.any(fixed_center_idx < 0) or torch.any(fixed_center_idx >= num_points):
+                raise IndexError('fixed_center_idx contains an out-of-range point index.')
+            center_idx = fixed_center_idx.to(torch.long).unsqueeze(0)
+            center = unorganized_pc_no_zeros.index_select(1, center_idx[0])
 
         # knn to get the neighborhood
         knn = KNN(k=self.args.group_size, transpose_mode=True)
@@ -145,6 +160,22 @@ class FPFHFeatures(Features):
         # center (1,group,3)
 
         # print(agg_point_feature.shape,unorganized_pc.shape,unorganized_pc_no_zeros.shape,center.shape)
+        if return_group_info:
+            points = unorganized_pc_no_zeros.squeeze(0)
+            knn_idx = ori_idx.squeeze(0)
+            group_features = (neighborhood.mean(dim=-2).squeeze(0)
+                              if not self.args.use_LFSA else agg_point_feature)
+            return {
+                'features': group_features.reshape(self.args.num_group, -1),
+                'positions': normalize_patch_positions(points, center.squeeze(0)),
+                'curvature': estimate_patch_curvature(
+                    points, knn_idx, k=getattr(self.args, 'curvature_k', 32)
+                ),
+                'center_idx': center_idx.squeeze(0),
+                'knn_idx': knn_idx,
+                'points': points,
+                'center': center,
+            }
         if getattr(self.args, 'agg_method', 'mean') == 'ncrp':
             return agg_point_feature,residual_feature,unorganized_pc,unorganized_pc_no_zeros,center
         return agg_point_feature,unorganized_pc,unorganized_pc_no_zeros,center

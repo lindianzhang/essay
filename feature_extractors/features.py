@@ -219,9 +219,13 @@ class Features(torch.nn.Module):
         self.ncrp_structure_calibration.clear()
         self.ncrp_residual_calibration.clear()
 
-    def compute_anomay_scores(self, patch, mask, label, path, unorganized_pc, unorganized_pc_no_zeros, center, residual_patch=None):
+    def compute_anomay_scores(self, patch, mask, label, path, unorganized_pc, unorganized_pc_no_zeros, center, residual_patch=None, external_patch_scores=None):
 
-        if getattr(self.args, 'agg_method', 'mean') == 'ncrp':
+        if external_patch_scores is not None:
+            min_val = torch.as_tensor(external_patch_scores, device=patch.device, dtype=torch.float32).reshape(-1)
+            if min_val.shape[0] != patch.shape[0]:
+                raise ValueError('external_patch_scores must contain one score per patch.')
+        elif getattr(self.args, 'agg_method', 'mean') == 'ncrp':
             structure_score, residual_score = self._ncrp_branch_scores(patch, residual_patch)
             structure_score = (
                 (structure_score - self.ncrp_structure_center) / self.ncrp_structure_scale

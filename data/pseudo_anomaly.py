@@ -1,0 +1,53 @@
+import numpy as np
+from scipy.spatial import cKDTree
+
+
+def generate_pseudo_anomaly(points, anomaly_type, rng, config):
+    """Deform a local surface on an already downsampled normal point cloud."""
+    if anomaly_type not in ('bump', 'dent', 'scratch'):
+        raise ValueError(f'Unknown pseudo anomaly type: {anomaly_type}')
+    original = np.asarray(points, dtype=np.float64)
+    if original.ndim != 2 or original.shape[1] != 3 or len(original) < 4:
+        raise ValueError('points must have shape [N, 3] with at least four points.')
+    config = {} if config is None else config
+    tree = cKDTree(original)
+    distances, _ = tree.query(original, k=min(2, len(original)))
+    spacing = float(np.median(distances[:, 1]))
+    diameter = float(np.linalg.norm(np.ptp(original, axis=0)))
+    scale = max(spacing, diameter * 1e-6, 1e-8)
+    center_index = int(rng.integers(len(original))) if hasattr(rng, 'integers') else int(rng.randint(len(original)))
+    location = original[center_index]
+    local_idx = tree.query(location, k=min(32, len(original)))[1]
+    local = original[np.atleast_1d(local_idx)]
+    _, eigenvectors = np.linalg.eigh(np.cov((local - local.mean(axis=0)).T))
+    normal = eigenvectors[:, 0]
+    if np.dot(normal, location - original.mean(axis=0)) < 0:
+        normal = -normal
+    tangent = eigenvectors[:, 2]
+    tangent_other = np.cross(normal, tangent)
+    angle = float(rng.uniform(0, 2 * np.pi))
+    direction = np.cos(angle) * tangent + np.sin(angle) * tangent_other
+    across = np.cross(normal, direction)
+    radius = max(scale * 2, diameter * float(rng.uniform(*config.get('area_range', (0.025, 0.10)))))
+    length = max(radius * 2, diameter * float(rng.uniform(*config.get('length_range', (0.06, 0.22)))))
+    width = max(scale * 1.5, radius * float(rng.uniform(0.35, 0.8)))
+    strength = max(scale, radius * float(rng.uniform(*config.get('strength_range', (0.15, 0.55)))))
+    offset = original - location
+    along = offset @ direction
+    sideways = offset @ across
+    if anomaly_type == 'scratch':
+        support = (np.abs(along) < length / 2) & (np.abs(sideways) < width)
+        profile = np.exp(-0.5 * (sideways / width) ** 2) * np.maximum(0, 1 - (2 * along / length) ** 2)
+        displacement = -strength * profile * support
+    else:
+        radial = np.linalg.norm(offset - np.outer(offset @ normal, normal), axis=1)
+        support = radial < radius
+        profile = np.maximum(0, 1 - (radial / radius) ** 2) ** 2
+        displacement = (1 if anomaly_type == 'bump' else -1) * strength * profile * support
+    mask = np.abs(displacement) > 0
+    changed = original + displacement[:, None] * normal
+    metadata = {'type': anomaly_type, 'location': location.tolist(),
+                'scale': {'radius': float(radius), 'length': float(length), 'width': float(width),
+                          'spacing': spacing}, 'strength': float(strength),
+                'direction': direction.tolist()}
+    return changed.astype(np.asarray(points).dtype, copy=False), mask.astype(np.uint8), metadata

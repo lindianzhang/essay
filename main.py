@@ -198,6 +198,17 @@ if __name__ == '__main__':
         parser.add_argument('--group_size', type=int, default=128, help='group_size')
         parser.add_argument('--agg_method', type=str, choices=['mean', 'ncrp'], default='mean',
                             help='mean: original Simple3D; ncrp: residual pooling (requires --use_LFSA True)')
+        parser.add_argument('--detector', choices=['simple3d', 'geometry_mlp'], default='simple3d')
+        parser.add_argument('--geom_action', choices=['train', 'eval'], default=None)
+        parser.add_argument('--geom_checkpoint', type=str, default='geometry_mlp.pt')
+        parser.add_argument('--geom_epochs', type=int, default=50)
+        parser.add_argument('--geom_batch_size', type=int, default=256)
+        parser.add_argument('--geom_lr', type=float, default=0.001)
+        parser.add_argument('--geom_seed', type=int, default=42)
+        parser.add_argument('--curvature_k', type=int, default=32)
+        parser.add_argument('--pseudo_per_sample', type=int, default=10)
+        parser.add_argument('--geom_use_position', type=parse_bool, default=True)
+        parser.add_argument('--geom_use_curvature', type=parse_bool, default=True)
         parser.add_argument('--msnd_impl', choices=['official', 'fixed'], default='official')
         parser.add_argument('--use_MSND', type=parse_bool, default=None)
         parser.add_argument('--use_LFSA', type=parse_bool, default=None)
@@ -228,7 +239,18 @@ if __name__ == '__main__':
             parser.error('NCRP requires --use_LFSA True; use the same LFSA setting for Mean ablations.')
         print(args)
 
-        run_3d_ads(args)
+        if args.detector == 'simple3d':
+            run_3d_ads(args)
+        else:
+            if args.dataset != 'real' or args.feature != 'FPFH' or args.agg_method != 'mean' or not args.use_LFSA:
+                raise ValueError('geometry_mlp requires dataset=real, feature=FPFH, agg_method=mean, and use_LFSA=True.')
+            if args.geom_action is None:
+                raise ValueError('geometry_mlp requires --geom_action train or eval.')
+            from geometry_mlp_runner import train_geometry_mlp, evaluate_geometry_mlp
+            if args.geom_action == 'train':
+                train_geometry_mlp(args)
+            else:
+                evaluate_geometry_mlp(args)
 
         print("=" * 80)
         print(f"[日志系统] 结束时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
