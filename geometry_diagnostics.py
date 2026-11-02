@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader, Subset
 from data.real3d import real3d_classes
 from feature_extractors.FPFH import FPFHFeatures
 from feature_extractors.geometry_features import build_group_labels
-from feature_extractors.geometry_mlp import GeometryFusionMLP
+from feature_extractors.geometry_mlp import ConcatFusionMLP, GeometryFusionMLP
 from geometry_mlp_runner import _extract, _loader, _normalized
 from patchcore_runner import PatchCore
 
@@ -130,16 +130,22 @@ def save_anomaly_comparison(record, output_dir, seed=42):
     rng = np.random.default_rng(seed)
     display_indices = (np.sort(rng.choice(len(points), size=10000, replace=False))
                        if len(points) > 10000 else np.arange(len(points)))
-    np.savez_compressed(
-        output_dir / f'{stem}.npz', sample_path=sample_path,
-        points=points, gt=gt, geometry_point_scores=geometry_scores,
-        simple3d_point_scores=baseline_scores, display_indices=display_indices,
-        center_idx=record['center_idx'], knn_idx=record['knn_idx'],
-        group_features=record['group_features'], embedding=record['embedding'],
-        positions=record['positions'], curvature=record['curvature'],
-        gate_weights=record['weights'], gt_anomaly_ratio=record['ratios'],
-        nearest_distance=record['distances'], nearest_bank_index=record['nearest_indices'],
-    )
+    arrays = {
+        'sample_path': sample_path,
+        'points': points, 'gt': gt,
+        'geometry_point_scores': geometry_scores,
+        'simple3d_point_scores': baseline_scores,
+        'display_indices': display_indices,
+        'center_idx': record['center_idx'], 'knn_idx': record['knn_idx'],
+        'group_features': record['group_features'], 'embedding': record['embedding'],
+        'positions': record['positions'], 'curvature': record['curvature'],
+        'gt_anomaly_ratio': record['ratios'],
+        'nearest_distance': record['distances'],
+        'nearest_bank_index': record['nearest_indices'],
+    }
+    if record['weights'] is not None:
+        arrays['gate_weights'] = record['weights']
+    np.savez_compressed(output_dir / f'{stem}.npz', **arrays)
 
     shown = points[display_indices]
     lower = points.min(axis=0)
@@ -315,8 +321,12 @@ def run_geometry_diagnostics(args):
     for key, value in checkpoint['feature_config'].items():
         setattr(extraction_args, key, value)
     extractor = FPFHFeatures(args=extraction_args)
-    model = GeometryFusionMLP(checkpoint['feature_dim'], checkpoint['hidden_dim'],
-                              **checkpoint['model_config']).to(args.device)
+    architecture = checkpoint.get('architecture', 'gate')
+    model_class = {'gate': GeometryFusionMLP, 'concat': ConcatFusionMLP}.get(architecture)
+    if model_class is None:
+        raise ValueError(f'Unknown checkpoint architecture: {architecture}')
+    model = model_class(checkpoint['feature_dim'], checkpoint['hidden_dim'],
+                        **checkpoint['model_config']).to(args.device)
     model.load_state_dict(checkpoint['model_state'])
     model.eval()
     statistics = checkpoint['normalization']
@@ -355,7 +365,8 @@ def run_geometry_diagnostics(args):
                 'embedding': embedding.detach().cpu().numpy(),
                 'positions': group['positions'].numpy(),
                 'curvature': group['curvature'].numpy(),
-                'weights': weights.detach().cpu().numpy(),
+                'weights': (weights.detach().cpu().numpy()
+                            if weights is not None else None),
                 'ratios': ratios.cpu().numpy(),
                 'distances': distances.detach().cpu().numpy(),
                 'nearest_indices': nearest_indices.detach().cpu().numpy(),
@@ -364,6 +375,7 @@ def run_geometry_diagnostics(args):
             records.append(record)
     if not records:
         raise ValueError('No test samples were selected for diagnostics.')
-    save_gate_weight_analysis(records, directories['gate_weights'])
+    if architecture == 'gate':
+        save_gate_weight_analysis(records, directories['gate_weights'])
     save_distance_analysis(records, directories['nearest_distances'])
     print(f'Geometry diagnostics saved to {root}')

@@ -18,7 +18,7 @@ from data.pseudo_anomaly import (
 from data.real3d import get_real_loader, real3d_classes
 from feature_extractors.FPFH import FPFHFeatures
 from feature_extractors.geometry_features import build_group_labels
-from feature_extractors.geometry_mlp import GeometryFusionMLP
+from feature_extractors.geometry_mlp import ConcatFusionMLP, GeometryFusionMLP
 
 
 _FEATURE_KEYS = ('geometry', 'position', 'curvature')
@@ -490,13 +490,25 @@ def train_geometry_mlp(args):
     train_loader = DataLoader(train_data, batch_size=args.geom_batch_size, shuffle=True)
     validation_loader = DataLoader(validation_data, batch_size=args.geom_batch_size)
     feature_dim = train_normals[0]['features'].shape[1]
-    model = GeometryFusionMLP(feature_dim, use_position=args.geom_use_position,
-                              use_curvature=args.geom_use_curvature).to(args.device)
+    model_class = {'gate': GeometryFusionMLP, 'concat': ConcatFusionMLP}.get(args.geom_arch)
+    if model_class is None:
+        raise ValueError(f'Unknown geometry MLP architecture: {args.geom_arch}')
+    model = model_class(feature_dim, use_position=args.geom_use_position,
+                        use_curvature=args.geom_use_curvature).to(args.device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.geom_lr)
     checkpoint_path = Path(args.geom_checkpoint)
-    resume_path = checkpoint_path.with_name(f'{checkpoint_path.stem}.resume.pt')
+    if args.geom_arch == 'concat':
+        artifact_name = f'{args.geom_category or "shared"}_concat'
+        best_checkpoint_path = checkpoint_path.with_name(f'{artifact_name}_best.pt')
+        last_checkpoint_path = checkpoint_path.with_name(f'{artifact_name}_last.pt')
+        resume_path = checkpoint_path.with_name(f'{artifact_name}.resume.pt')
+    else:
+        best_checkpoint_path = checkpoint_path
+        last_checkpoint_path = checkpoint_path.with_name(f'{checkpoint_path.stem}_last.pt')
+        resume_path = checkpoint_path.with_name(f'{checkpoint_path.stem}.resume.pt')
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     resume_model_config = {
+        'architecture': args.geom_arch,
         'feature_dim': feature_dim,
         'hidden_dim': 64,
         'use_position': args.geom_use_position,
@@ -509,6 +521,7 @@ def train_geometry_mlp(args):
                          for name, value in model.state_dict().items()},
     }
     resume_training_config = {
+        'architecture': args.geom_arch,
         'optimizer': 'Adam',
         'batch_size': args.geom_batch_size,
         'lr': args.geom_lr,
@@ -540,11 +553,13 @@ def train_geometry_mlp(args):
     }
     best_loss = float('inf')
     best_state = None
+    last_validation_loss = float('nan')
     start_epoch = 0
     if args.geom_resume and resume_path.exists():
         resume = torch.load(resume_path, map_location='cpu')
         if (not isinstance(resume, dict)
                 or resume.get('resume_format') != 'geometry_mlp_training_v1'
+                or resume.get('architecture') != args.geom_arch
                 or resume.get('model_config') != resume_model_config
                 or resume.get('training_config') != resume_training_config
                 or resume.get('data_config') != resume_data_config):
@@ -565,6 +580,7 @@ def train_geometry_mlp(args):
         optimizer.load_state_dict(resume['optimizer_state'])
         best_loss = float(resume['best_loss'])
         best_state = copy.deepcopy(resume['best_model_state'])
+        last_validation_loss = float(resume.get('last_validation_loss', float('nan')))
         if best_state is None and start_epoch > 0:
             raise ValueError(f'Resume checkpoint has no best model state: {resume_path}')
         saved_cuda = resume['cuda_rng_state']
@@ -584,6 +600,7 @@ def train_geometry_mlp(args):
     for epoch in range(start_epoch, args.geom_epochs):
         training_loss = _epoch(model, train_loader, args.device, optimizer)
         validation_loss = _epoch(model, validation_loader, args.device)
+        last_validation_loss = validation_loss
         print(f'Epoch {epoch + 1}: train loss {training_loss:.6f}, validation loss {validation_loss:.6f}')
         if validation_loss < best_loss:
             best_loss = validation_loss
@@ -591,11 +608,13 @@ def train_geometry_mlp(args):
         numpy_state = np.random.get_state()
         resume_state = {
             'resume_format': 'geometry_mlp_training_v1',
+            'architecture': args.geom_arch,
             'epoch': epoch + 1,
             'model_state': model.state_dict(),
             'optimizer_state': optimizer.state_dict(),
             'best_loss': best_loss,
             'best_model_state': best_state,
+            'last_validation_loss': last_validation_loss,
             'model_config': resume_model_config,
             'training_config': resume_training_config,
             'data_config': resume_data_config,
@@ -624,30 +643,35 @@ def train_geometry_mlp(args):
                 temporary_path.unlink()
     if best_state is None:
         raise ValueError('--geom_epochs must be positive.')
-    model.load_state_dict(best_state)
-    model.eval()
-    memory_bank = {
-        category: torch.cat([_embedding(model, group, statistics, args.device).cpu()
-                             for group in groups], dim=0)
-        for category, groups in normal_groups_by_category.items()
-    }
-    torch.save({
-        'model_state': best_state,
-        'memory_bank': memory_bank,
-        'trained_categories': categories,
-        'normalization': statistics,
-        'feature_dim': feature_dim,
-        'hidden_dim': 64,
-        'feature_config': {key: getattr(args, key) for key in _EXTRACTION_KEYS},
-        'model_config': {'use_position': args.geom_use_position,
-                         'use_curvature': args.geom_use_curvature},
-        'training_config': {'epochs': args.geom_epochs, 'batch_size': args.geom_batch_size,
-                            'lr': args.geom_lr, 'seed': args.geom_seed,
-                            'pseudo_per_sample': args.pseudo_per_sample,
-                            'pseudo_generator': args.pseudo_generator},
-        'validation_loss': best_loss,
-    }, checkpoint_path)
-    print(f'Saved shared geometry MLP checkpoint: {checkpoint_path}')
+    last_state = copy.deepcopy(model.state_dict())
+    for output_path, state, recorded_loss in (
+            (last_checkpoint_path, last_state, last_validation_loss),
+            (best_checkpoint_path, best_state, best_loss)):
+        model.load_state_dict(state)
+        model.eval()
+        memory_bank = {
+            category: torch.cat([_embedding(model, group, statistics, args.device).cpu()
+                                 for group in groups], dim=0)
+            for category, groups in normal_groups_by_category.items()
+        }
+        torch.save({
+            'model_state': state,
+            'memory_bank': memory_bank,
+            'trained_categories': categories,
+            'architecture': args.geom_arch,
+            'normalization': statistics,
+            'feature_dim': feature_dim,
+            'hidden_dim': 64,
+            'feature_config': {key: getattr(args, key) for key in _EXTRACTION_KEYS},
+            'model_config': {'use_position': args.geom_use_position,
+                             'use_curvature': args.geom_use_curvature},
+            'training_config': {'epochs': args.geom_epochs, 'batch_size': args.geom_batch_size,
+                                'lr': args.geom_lr, 'seed': args.geom_seed,
+                                'pseudo_per_sample': args.pseudo_per_sample,
+                                'pseudo_generator': args.pseudo_generator},
+            'validation_loss': recorded_loss,
+        }, output_path)
+        print(f'Saved geometry MLP checkpoint: {output_path}')
 
 
 def evaluate_geometry_mlp(args):
@@ -668,8 +692,12 @@ def evaluate_geometry_mlp(args):
     for key, value in checkpoint['feature_config'].items():
         setattr(extraction_args, key, value)
     extractor = FPFHFeatures(args=extraction_args)
-    model = GeometryFusionMLP(checkpoint['feature_dim'], checkpoint['hidden_dim'],
-                              **checkpoint['model_config']).to(args.device)
+    architecture = checkpoint.get('architecture', 'gate')
+    model_class = {'gate': GeometryFusionMLP, 'concat': ConcatFusionMLP}.get(architecture)
+    if model_class is None:
+        raise ValueError(f'Unknown checkpoint architecture: {architecture}')
+    model = model_class(checkpoint['feature_dim'], checkpoint['hidden_dim'],
+                        **checkpoint['model_config']).to(args.device)
     model.load_state_dict(checkpoint['model_state'])
     model.eval()
     statistics = checkpoint['normalization']

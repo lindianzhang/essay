@@ -26,3 +26,25 @@ class GeometryFusionMLP(nn.Module):
         weights = torch.softmax(gate_logits.masked_fill(~enabled, float('-inf')), dim=1)
         embedding = (branches * weights.unsqueeze(-1)).sum(dim=1) + geometry_feature
         return embedding, weights
+
+
+class ConcatFusionMLP(nn.Module):
+    def __init__(self, feature_dim, hidden_dim=64,
+                 use_position=True, use_curvature=True):
+        super().__init__()
+        self.use_position = use_position
+        self.use_curvature = use_curvature
+        self.net = nn.Sequential(
+            nn.Linear(feature_dim + 4, 128),
+            nn.ReLU(),
+            nn.Linear(128, hidden_dim)
+        )
+
+    def forward(self, geometry, position, curvature):
+        if not self.use_position:
+            position = torch.zeros_like(position)
+        if not self.use_curvature:
+            curvature = torch.zeros_like(curvature)
+
+        x = torch.cat([geometry, position, curvature], dim=1)
+        return self.net(x), None
