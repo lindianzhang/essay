@@ -214,6 +214,7 @@ if __name__ == '__main__':
         parser.add_argument('--diag_dir', type=str, default=None)
         parser.add_argument('--diag_compare_baseline', type=parse_bool, default=True)
         parser.add_argument('--geom_checkpoint', type=str, default='geometry_mlp.pt')
+        parser.add_argument('--geom_category', type=str, default=None)
         parser.add_argument('--geom_epochs', type=int, default=50)
         parser.add_argument('--geom_resume', type=parse_bool, default=True)
         parser.add_argument('--geom_batch_size', type=int, default=256)

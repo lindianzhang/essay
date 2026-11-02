@@ -420,7 +420,15 @@ def train_geometry_mlp(args):
     train_normals, validation_normals = [], []
     normal_groups_by_category = {}
     normal_samples_by_category = {}
-    for category in real3d_classes():
+    categories = (
+        [args.geom_category]
+        if args.geom_category is not None
+        else real3d_classes()
+    )
+    if not set(categories).issubset(set(real3d_classes())):
+        raise ValueError(f'Invalid category: {args.geom_category}')
+
+    for category in categories:
         samples = [
             (pc, str(path[0] if isinstance(path, (tuple, list)) else path))
             for pc, _, label, path in _loader(args, 'train', category)
@@ -511,6 +519,7 @@ def train_geometry_mlp(args):
     }
     resume_data_config = {
         'dataset': args.dataset,
+        'trained_categories': categories,
         'feature': args.feature,
         'agg_method': args.agg_method,
         'real3d_format': args.real3d_format,
@@ -625,6 +634,7 @@ def train_geometry_mlp(args):
     torch.save({
         'model_state': best_state,
         'memory_bank': memory_bank,
+        'trained_categories': categories,
         'normalization': statistics,
         'feature_dim': feature_dim,
         'hidden_dim': 64,
@@ -642,6 +652,18 @@ def train_geometry_mlp(args):
 
 def evaluate_geometry_mlp(args):
     checkpoint = torch.load(args.geom_checkpoint, map_location='cpu')
+    trained_categories = checkpoint.get('trained_categories')
+    if trained_categories is None:
+        trained_categories = list(checkpoint['memory_bank'])
+    if args.geom_category is not None:
+        if (args.geom_category not in trained_categories
+                or args.geom_category not in checkpoint['memory_bank']):
+            raise ValueError(f'Category {args.geom_category} is not present in the checkpoint.')
+        categories = [args.geom_category]
+    else:
+        categories = list(trained_categories)
+    if not categories or any(category not in checkpoint['memory_bank'] for category in categories):
+        raise ValueError('Checkpoint has no valid trained categories for evaluation.')
     extraction_args = copy.copy(args)
     for key, value in checkpoint['feature_config'].items():
         setattr(extraction_args, key, value)
@@ -652,7 +674,7 @@ def evaluate_geometry_mlp(args):
     model.eval()
     statistics = checkpoint['normalization']
     results = []
-    for category in real3d_classes():
+    for category in categories:
         extractor.init_para()
         bank = checkpoint['memory_bank'][category].to(args.device)
         for pc, mask, label, path in _loader(args, 'test', category):
@@ -671,6 +693,7 @@ def evaluate_geometry_mlp(args):
         result = (extractor.image_rocauc, extractor.pixel_rocauc, p_aupr)
         results.append(result)
         print(f'{category}: O-AUROC={result[0]:.3f}, P-AUROC={result[1]:.3f}, P-AUPR={result[2]:.3f}')
-    mean = np.nanmean(np.asarray(results), axis=0)
-    print(f'Mean: O-AUROC={mean[0]:.3f}, P-AUROC={mean[1]:.3f}, P-AUPR={mean[2]:.3f}')
+    if len(categories) > 1:
+        mean = np.nanmean(np.asarray(results), axis=0)
+        print(f'Mean: O-AUROC={mean[0]:.3f}, P-AUROC={mean[1]:.3f}, P-AUPR={mean[2]:.3f}')
     return results
