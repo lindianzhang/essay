@@ -497,15 +497,11 @@ def train_geometry_mlp(args):
                         use_curvature=args.geom_use_curvature).to(args.device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.geom_lr)
     checkpoint_path = Path(args.geom_checkpoint)
-    if args.geom_arch == 'concat':
-        artifact_name = f'{args.geom_category or "shared"}_concat'
-        best_checkpoint_path = checkpoint_path.with_name(f'{artifact_name}_best.pt')
-        last_checkpoint_path = checkpoint_path.with_name(f'{artifact_name}_last.pt')
-        resume_path = checkpoint_path.with_name(f'{artifact_name}.resume.pt')
-    else:
-        best_checkpoint_path = checkpoint_path
-        last_checkpoint_path = checkpoint_path.with_name(f'{checkpoint_path.stem}_last.pt')
-        resume_path = checkpoint_path.with_name(f'{checkpoint_path.stem}.resume.pt')
+    checkpoint_prefix = (checkpoint_path.with_suffix('')
+                         if checkpoint_path.suffix.lower() == '.pt' else checkpoint_path)
+    best_checkpoint_path = checkpoint_prefix.with_name(f'{checkpoint_prefix.name}_best.pt')
+    last_checkpoint_path = checkpoint_prefix.with_name(f'{checkpoint_prefix.name}_last.pt')
+    resume_path = checkpoint_prefix.with_name(f'{checkpoint_prefix.name}.resume.pt')
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     resume_model_config = {
         'architecture': args.geom_arch,

@@ -1,4 +1,4 @@
-import os
+﻿import os
 from PIL import Image
 from torchvision import transforms
 import glob
@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader
 import numpy as np
 import open3d as o3d
 import torch
-DATASETS_PATH = '/root/autodl-fs/Real3D-AD-PCD/Real3D-AD-PCD'
+DATASETS_PATH = os.environ.get('REAL3D_PCD_ROOT', '/root/autodl-fs/Real3D-AD-PCD/Real3D-AD-PCD')
 OFFICIAL_DATASETS_PATH = '../Semicore/data/real3d_train_cut'
 def real3d_classes():
     return [
@@ -271,3 +271,4 @@ def get_real_loader(split, class_name, data_format='pcd', data_root=None):
     data_loader = DataLoader(dataset=dataset, batch_size=1, shuffle=False, num_workers=1, drop_last=False,
                              pin_memory=True)
     return data_loader
+

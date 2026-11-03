@@ -1,3 +1,20 @@
-
+# Local Python environment
+.venv4060/
 __pycache__/
-*.pyc
+
+# Local experiment caches
+/cache_4060/
+/pseudo_cache_local4060/
+
+# Local checkpoints
+/checkpoints/local4060_*/
+
+# Experiment logs
+/logs/
+
+# Backup files
+*.bak
+
+# Local RTX 4060 test scripts
+/airplane_4060_original_test.py
+/airplane_4060_smoke.py
