@@ -61,7 +61,15 @@ class FPFHFeatures(Features):
         unorganized_pc = unorganized_pc.squeeze(0).numpy() #(n,3)
 
 
-        if self.args.dataset == 'mvtec' or self.args.dataset == 'eyecandies':
+        geometry_mvtec = (self.args.dataset == 'mvtec'
+                          and getattr(self.args, 'detector', 'simple3d') == 'geometry_mlp')
+        if geometry_mvtec and fixed_center_idx is not None:
+            # Pseudo anomalies already use the normal cloud's valid-point order.
+            unorganized_pc_no_zeros = unorganized_pc
+        elif geometry_mvtec:
+            valid = np.isfinite(unorganized_pc).all(axis=1) & np.all(unorganized_pc != 0, axis=1)
+            unorganized_pc_no_zeros = unorganized_pc[valid, :]
+        elif self.args.dataset == 'mvtec' or self.args.dataset == 'eyecandies':
             nonzero_indices = np.nonzero(np.all(unorganized_pc != 0, axis=1))[0]
             unorganized_pc_no_zeros = unorganized_pc[nonzero_indices, :]
         else:

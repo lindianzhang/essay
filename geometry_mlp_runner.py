@@ -16,6 +16,7 @@ from data.pseudo_anomaly import (
     generate_pseudo_anomaly,
 )
 from data.real3d import get_real_loader, real3d_classes
+from data.mvtec3d import get_mvtec_loader, mvtec3d_classes
 from feature_extractors.FPFH import FPFHFeatures
 from feature_extractors.geometry_features import build_group_labels
 from feature_extractors.geometry_mlp import ConcatFusionMLP, GeometryFusionMLP
@@ -28,6 +29,11 @@ _CACHE_VERSION = 1
 _MULTISCALE_GENERATOR_VERSION = 1
 _MULTISCALE_PART_NUMS = (384, 192, 96, 48)
 _SOURCE_FINGERPRINT_CACHE = {}
+_MVTEC_PREPROCESSING = {
+    'target_size': [224, 224],
+    'resize': 'nearest',
+    'valid_xyz': 'finite_and_all_components_nonzero',
+}
 
 
 def _source_fingerprint(kind):
@@ -35,6 +41,10 @@ def _source_fingerprint(kind):
         'pseudo': ('data/pseudo_anomaly.py',),
         'feature': ('feature_extractors/FPFH.py',
                     'feature_extractors/geometry_features.py', 'data/real3d.py'),
+        'mvtec_feature': ('feature_extractors/FPFH.py',
+                          'feature_extractors/geometry_features.py',
+                          'feature_extractors/features.py', 'data/mvtec3d.py',
+                          'utils/mvtec3d_util.py'),
     }
     if kind not in sources:
         raise ValueError(f'Unknown source fingerprint kind: {kind}')
@@ -48,8 +58,20 @@ def _source_fingerprint(kind):
 
 
 def _loader(args, split, category):
+    if args.dataset == 'mvtec':
+        return get_mvtec_loader(split, class_name=category,
+                                data_root=getattr(args, 'mvtec_root', None))
     return get_real_loader(split, class_name=category,
                            data_format=args.real3d_format, data_root=args.real3d_root)
+
+
+def _feature_config(args):
+    config = {key: getattr(args, key) for key in _EXTRACTION_KEYS}
+    config['use_LFSA'] = args.use_LFSA
+    if args.dataset == 'mvtec':
+        config['dataset'] = 'mvtec'
+        config['preprocessing'] = _MVTEC_PREPROCESSING
+    return config
 
 
 def _extract(extractor, pc, center_idx=None):
@@ -101,7 +123,8 @@ def _make_cache_key(points, sample_id, category, split, anomaly_index, generator
         'generator_config': generator_config,
         'seed': int(seed),
         'source_fingerprint': _source_fingerprint(
-            'feature' if feature_config is not None else 'pseudo'
+            'pseudo' if feature_config is None else
+            'mvtec_feature' if feature_config.get('dataset') == 'mvtec' else 'feature'
         ),
     }
     if feature_config is not None:
@@ -197,8 +220,7 @@ def _load_or_generate_pseudo(points, sample_id, anomaly_index, seed, normals,
 def _load_or_extract_group(pc, extractor, cache_key, center_idx=None, cache_status=None):
     args = extractor.args
     cache_path = Path(args.pseudo_cache_dir) / 'features' / f'{cache_key}.pt'
-    feature_config = {key: getattr(args, key) for key in _EXTRACTION_KEYS}
-    feature_config['use_LFSA'] = args.use_LFSA
+    feature_config = _feature_config(args)
     expected_points = pc.squeeze(0).detach().cpu().to(torch.float32)
     group_count = args.num_group
     point_count = expected_points.shape[0]
@@ -261,23 +283,21 @@ def _load_or_extract_group(pc, extractor, cache_key, center_idx=None, cache_stat
 
 
 def _collect_examples(args, extractor, samples, normals, statistics, rng, count,
-                      sample_ids, split, progress_desc):
-    if len(samples) != len(normals) or len(samples) != len(sample_ids):
-        raise ValueError('samples, normals, and sample_ids must correspond one-to-one.')
+                      sample_ids, sample_categories, split, progress_desc):
+    if not (len(samples) == len(normals) == len(sample_ids) == len(sample_categories)):
+        raise ValueError('samples, normals, sample_ids, and categories must correspond one-to-one.')
     normal_features_by_branch = [[] for _ in _FEATURE_KEYS]
     pseudo_features_by_branch = [[] for _ in _FEATURE_KEYS]
     labels, weights = [], []
     cache_root = Path(args.pseudo_cache_dir)
-    feature_config = {key: getattr(args, key) for key in _EXTRACTION_KEYS}
-    feature_config['use_LFSA'] = args.use_LFSA
+    feature_config = _feature_config(args)
     cache_hit = generated = 0
     with tqdm(total=len(samples) * count, desc=progress_desc,
               dynamic_ncols=True, unit='anomaly') as progress:
-        for sample_number, (pc, normal, sample_id) in enumerate(
-                zip(samples, normals, sample_ids), start=1):
+        for sample_number, (pc, normal, sample_id, category) in enumerate(
+                zip(samples, normals, sample_ids, sample_categories), start=1):
             normal_features = _normalized(normal, statistics)
             points = pc.squeeze(0).numpy()
-            category = Path(sample_id).parent.parent.name
             normal_cache = {}
             for index in range(count):
                 seed_input = json.dumps(
@@ -313,6 +333,11 @@ def _collect_examples(args, extractor, samples, normals, statistics, rng, count,
                     }
                 else:
                     raise ValueError(f'Unknown pseudo generator: {args.pseudo_generator}')
+                if args.dataset == 'mvtec':
+                    generator_config = {
+                        **generator_config, 'dataset': 'mvtec',
+                        'preprocessing': _MVTEC_PREPROCESSING,
+                    }
                 pseudo_key = _make_cache_key(
                     points, sample_id, category, split, index,
                     args.pseudo_generator, generator_config, item_seed
@@ -412,11 +437,26 @@ def _embedding(model, group, statistics, device):
     return embedding
 
 
-def _nearest_bank_scores(embedding, bank, chunk_size=256):
-    return torch.cat([
-        torch.cdist(embedding[start:start + chunk_size], bank).min(dim=1).values
-        for start in range(0, embedding.shape[0], chunk_size)
-    ])
+def _nearest_bank_scores(embedding, bank, chunk_size=256, bank_chunk_size=None):
+    if bank_chunk_size is None:
+        return torch.cat([
+            torch.cdist(embedding[start:start + chunk_size], bank).min(dim=1).values
+            for start in range(0, embedding.shape[0], chunk_size)
+        ])
+    if bank_chunk_size < 1 or bank.shape[0] == 0:
+        raise ValueError('Memory Bank must be nonempty and bank_chunk_size positive.')
+    scores = []
+    for start in range(0, embedding.shape[0], chunk_size):
+        query = embedding[start:start + chunk_size]
+        minimum = None
+        for bank_start in range(0, bank.shape[0], bank_chunk_size):
+            candidates = bank[bank_start:bank_start + bank_chunk_size].to(
+                query.device, non_blocking=True
+            )
+            distances = torch.cdist(query, candidates).min(dim=1).values
+            minimum = distances if minimum is None else torch.minimum(minimum, distances)
+        scores.append(minimum)
+    return torch.cat(scores)
 
 
 def train_geometry_mlp(args):
@@ -424,9 +464,14 @@ def train_geometry_mlp(args):
         raise ValueError('--pseudo_per_sample must be at least 3 to include every anomaly type.')
     if args.pseudo_cache_dir is None:
         args.pseudo_cache_dir = str(
-            Path('/root/autodl-fs/real3d_pseudo_cache') if os.name == 'posix'
-            else Path(__file__).resolve().parent / 'pseudo_cache'
+            (Path('/root/autodl-fs/mvtec3d_pseudo_cache') if args.dataset == 'mvtec'
+             else Path('/root/autodl-fs/real3d_pseudo_cache')) if os.name == 'posix'
+            else Path(__file__).resolve().parent / 'pseudo_cache' /
+            ('mvtec' if args.dataset == 'mvtec' else '')
         )
+    elif args.dataset == 'mvtec':
+        args.pseudo_cache_dir = str(Path(args.pseudo_cache_dir) / 'mvtec' /
+                                    _MVTEC_PREPROCESSING['valid_xyz'])
     torch.manual_seed(args.geom_seed)
     np.random.seed(args.geom_seed)
     rng = np.random.default_rng(args.geom_seed)
@@ -434,6 +479,7 @@ def train_geometry_mlp(args):
     torch.manual_seed(args.geom_seed)
     train_samples, validation_samples = [], []
     train_ids, validation_ids = [], []
+    train_categories, validation_categories = [], []
     train_cache_keys, validation_cache_keys = [], []
     train_normals, validation_normals = [], []
     normal_groups_by_category = {}
@@ -441,30 +487,52 @@ def train_geometry_mlp(args):
     categories = (
         [args.geom_category]
         if args.geom_category is not None
-        else real3d_classes()
+        else mvtec3d_classes() if args.dataset == 'mvtec' else real3d_classes()
     )
-    if not set(categories).issubset(set(real3d_classes())):
+    available_categories = mvtec3d_classes() if args.dataset == 'mvtec' else real3d_classes()
+    if not set(categories).issubset(set(available_categories)):
         raise ValueError(f'Invalid category: {args.geom_category}')
 
     for category in categories:
-        samples = [
-            (pc, str(path[0] if isinstance(path, (tuple, list)) else path))
-            for pc, _, label, path in _loader(args, 'train', category)
-            if int(torch.as_tensor(label).reshape(-1)[0]) == 0
-        ]
-        if len(samples) != 4:
+        samples = []
+        for pc, _, label, path in _loader(args, 'train', category):
+            if int(torch.as_tensor(label).reshape(-1)[0]) != 0:
+                continue
+            if args.dataset == 'mvtec':
+                xyz = pc.squeeze(0)
+                valid = torch.isfinite(xyz).all(dim=1) & (xyz != 0).all(dim=1)
+                xyz = xyz[valid]
+                if xyz.shape[0] < max(args.group_size, args.num_group):
+                    raise ValueError(f'Too few valid XYZ points in {path}: {xyz.shape[0]}')
+                pc = xyz.unsqueeze(0)
+            samples.append((pc, str(path[0] if isinstance(path, (tuple, list)) else path)))
+        if args.dataset == 'real' and len(samples) != 4:
             raise ValueError(f'{category} requires four normal training samples; found {len(samples)}.')
+        if args.dataset == 'mvtec' and len(samples) < 2:
+            raise ValueError(f'{category} requires at least two normal training samples.')
         normal_samples_by_category[category] = samples
-    feature_config = {key: getattr(args, key) for key in _EXTRACTION_KEYS}
-    feature_config['use_LFSA'] = args.use_LFSA
+    feature_config = _feature_config(args)
     normal_count = sum(len(samples) for samples in normal_samples_by_category.values())
+    if args.dataset == 'mvtec':
+        validation_splits = {
+            category: set(rng.choice(
+                len(samples),
+                size=max(1, int(np.ceil(len(samples) * 0.2))),
+                replace=False,
+            ).tolist())
+            for category, samples in normal_samples_by_category.items()
+        }
     with tqdm(total=normal_count, desc='Normal feature extraction',
               dynamic_ncols=True, unit='sample') as normal_progress:
         for category, samples in normal_samples_by_category.items():
-            held_out = int(rng.integers(4))
+            if args.dataset == 'real':
+                validation_indices = {int(rng.integers(4))}
+            else:
+                validation_indices = validation_splits[category]
             groups = []
             for index, (pc, sample_id) in enumerate(samples):
-                split = 'validation' if index == held_out else 'train'
+                is_validation = index in validation_indices
+                split = 'validation' if is_validation else 'train'
                 points = pc.squeeze(0).numpy()
                 if args.pseudo_generator == 'nature3d':
                     generator_config = {'part_num': 96, 'distance_range': [0.06, 0.08]}
@@ -480,6 +548,11 @@ def train_geometry_mlp(args):
                         'anomaly_types': ['bump', 'dent', 'scratch'],
                         'scale_probabilities': [0.7, 0.2, 0.1],
                     }
+                if args.dataset == 'mvtec':
+                    generator_config = {
+                        **generator_config, 'dataset': 'mvtec',
+                        'preprocessing': _MVTEC_PREPROCESSING,
+                    }
                 group_key = _make_cache_key(
                     points, sample_id, category, split, None,
                     args.pseudo_generator, generator_config, args.geom_seed,
@@ -490,28 +563,49 @@ def train_geometry_mlp(args):
                     refresh=True
                 )
                 normal_progress.refresh()
+                if args.dataset == 'mvtec' and is_validation:
+                    groups.append(None)
+                    normal_progress.update(1)
+                    validation_samples.append(pc)
+                    validation_ids.append(sample_id)
+                    validation_categories.append(category)
+                    validation_cache_keys.append(group_key)
+                    continue
                 group = _load_or_extract_group(pc, extractor, group_key)
                 groups.append(group)
                 normal_progress.update(1)
-                if index == held_out:
+                if is_validation:
                     validation_samples.append(pc)
                     validation_normals.append(group)
                     validation_ids.append(sample_id)
+                    validation_categories.append(category)
                     validation_cache_keys.append(group_key)
                 else:
                     train_samples.append(pc)
                     train_normals.append(group)
                     train_ids.append(sample_id)
+                    train_categories.append(category)
                     train_cache_keys.append(group_key)
-            normal_groups_by_category[category] = groups
+            normal_groups_by_category[category] = (
+                [group for group in groups if group is not None]
+                if args.dataset == 'mvtec' else groups
+            )
     statistics = _normalization(train_normals)
+    if args.dataset == 'mvtec':
+        for pc, sample_id, category, group_key in zip(
+                validation_samples, validation_ids, validation_categories,
+                validation_cache_keys):
+            validation_normals.append(
+                _load_or_extract_group(pc, extractor, group_key)
+            )
     train_data = _collect_examples(args, extractor, train_samples, train_normals,
                                    statistics, rng, args.pseudo_per_sample,
-                                   train_ids, 'train', 'Training pseudo anomalies')
+                                   train_ids, train_categories, 'train',
+                                   'Training pseudo anomalies')
     validation_rng = np.random.default_rng(args.geom_seed + 1)
     validation_data = _collect_examples(args, extractor, validation_samples,
                                         validation_normals, statistics, validation_rng, 3,
-                                        validation_ids, 'validation',
+                                        validation_ids, validation_categories, 'validation',
                                         'Validation pseudo anomalies')
     train_loader = DataLoader(train_data, batch_size=args.geom_batch_size, shuffle=True)
     validation_loader = DataLoader(validation_data, batch_size=args.geom_batch_size)
@@ -576,8 +670,16 @@ def train_geometry_mlp(args):
              'scale_probabilities': [0.7, 0.2, 0.1]}
         ),
         'pseudo_source_fingerprint': _source_fingerprint('pseudo'),
-        'feature_source_fingerprint': _source_fingerprint('feature'),
+        'feature_source_fingerprint': _source_fingerprint(
+            'mvtec_feature' if args.dataset == 'mvtec' else 'feature'
+        ),
     }
+    if args.dataset == 'mvtec':
+        resume_data_config.update({
+            'mvtec_root': str(args.mvtec_root),
+            'preprocessing': _MVTEC_PREPROCESSING,
+            'validation_fraction': 0.2,
+        })
     best_loss = float('inf')
     best_state = None
     last_validation_loss = float('nan')
@@ -685,11 +787,16 @@ def train_geometry_mlp(args):
             'model_state': state,
             'memory_bank': memory_bank,
             'trained_categories': categories,
+            'dataset': args.dataset,
+            'preprocessing': (_MVTEC_PREPROCESSING if args.dataset == 'mvtec' else None),
             'architecture': args.geom_arch,
             'normalization': statistics,
             'feature_dim': feature_dim,
             'hidden_dim': 64,
-            'feature_config': {key: getattr(args, key) for key in _EXTRACTION_KEYS},
+            'feature_config': (
+                _feature_config(args) if args.dataset == 'mvtec'
+                else {key: getattr(args, key) for key in _EXTRACTION_KEYS}
+            ),
             'model_config': {'use_position': args.geom_use_position,
                              'use_curvature': args.geom_use_curvature},
             'training_config': {'epochs': args.geom_epochs, 'batch_size': args.geom_batch_size,
@@ -705,8 +812,24 @@ def evaluate_geometry_mlp(args):
     import csv
     from datetime import datetime, timezone
     from data.real3d import DATASETS_PATH, OFFICIAL_DATASETS_PATH
+    from data.mvtec3d import DATASETS_PATH as MVTEC_DATASETS_PATH
 
     checkpoint = torch.load(args.geom_checkpoint, map_location='cpu')
+    checkpoint_dataset = checkpoint.get('dataset', 'real')
+    if checkpoint_dataset != args.dataset:
+        raise ValueError(f'Checkpoint dataset is {checkpoint_dataset}, but --dataset is {args.dataset}.')
+    if args.dataset == 'mvtec' and checkpoint.get('preprocessing') != _MVTEC_PREPROCESSING:
+        raise ValueError('MVTec preprocessing differs from the checkpoint.')
+    if args.dataset == 'mvtec':
+        saved_feature_config = checkpoint['feature_config']
+        if saved_feature_config.get('dataset') != 'mvtec':
+            raise ValueError('Checkpoint is missing MVTec feature configuration.')
+        for key, value in saved_feature_config.items():
+            if key in ('dataset', 'preprocessing'):
+                continue
+            if key in ('num_group', 'group_size', 'use_MSND', 'num_MSND', 'msnd_impl',
+                       'use_LFSA') and getattr(args, key, None) != value:
+                raise ValueError(f'MVTec feature setting {key} differs from checkpoint.')
     trained_categories = checkpoint.get('trained_categories')
     if trained_categories is None:
         trained_categories = list(checkpoint['memory_bank'])
@@ -721,7 +844,8 @@ def evaluate_geometry_mlp(args):
         raise ValueError('Checkpoint has no valid trained categories for evaluation.')
     extraction_args = copy.copy(args)
     for key, value in checkpoint['feature_config'].items():
-        setattr(extraction_args, key, value)
+        if key not in ('dataset', 'preprocessing'):
+            setattr(extraction_args, key, value)
     extractor = FPFHFeatures(args=extraction_args)
     architecture = checkpoint.get('architecture', 'gate')
     model_class = {'gate': GeometryFusionMLP, 'concat': ConcatFusionMLP}.get(architecture)
@@ -733,16 +857,34 @@ def evaluate_geometry_mlp(args):
     model.eval()
     statistics = checkpoint['normalization']
     results = []
+    au_pro_results = []
     diagnostic_rows = []
-    data_root = (args.real3d_root or OFFICIAL_DATASETS_PATH
-                 if args.real3d_format == 'official' else DATASETS_PATH)
+    data_root = ((args.mvtec_root or os.environ.get('MVTEC3D_ROOT') or MVTEC_DATASETS_PATH)
+                 if args.dataset == 'mvtec' else
+                 (args.real3d_root or OFFICIAL_DATASETS_PATH
+                  if args.real3d_format == 'official' else DATASETS_PATH))
     for category in categories:
         extractor.init_para()
-        bank = checkpoint['memory_bank'][category].to(args.device)
+        bank = (checkpoint['memory_bank'][category]
+                if args.dataset == 'mvtec'
+                else checkpoint['memory_bank'][category].to(args.device))
         for pc, mask, label, path in _loader(args, 'test', category):
+            if args.dataset == 'mvtec' and (
+                    pc.shape != (1, 224 * 224, 3)
+                    or mask.shape != (1, 1, 224, 224)):
+                raise ValueError(f'MVTec point grid and GT mask must be 224x224: {path}')
+            if args.dataset == 'mvtec':
+                xyz = pc.squeeze(0)
+                valid_count = int((torch.isfinite(xyz).all(dim=1)
+                                   & (xyz != 0).all(dim=1)).sum().item())
+                if valid_count < extraction_args.num_group:
+                    raise ValueError(f'Too few valid XYZ points for FPS in {path}: {valid_count}')
             group = _extract(extractor, pc)
             embedding = _embedding(model, group, statistics, args.device)
-            scores = _nearest_bank_scores(embedding, bank)
+            scores = _nearest_bank_scores(
+                embedding, bank,
+                bank_chunk_size=2048 if args.dataset == 'mvtec' else None
+            )
             extractor.compute_anomay_scores(
                 group['features'], mask, label, path, pc.squeeze(0),
                 group['points'].unsqueeze(0).to(args.device), group['center'].to(args.device),
@@ -752,11 +894,17 @@ def evaluate_geometry_mlp(args):
             is_anomaly = int(torch.as_tensor(label).reshape(-1)[0].item())
             if not is_anomaly:
                 anomaly_type = 'good'
+            elif args.dataset == 'mvtec':
+                anomaly_type = sample_path.parent.parent.name
             elif args.real3d_format == 'official':
                 anomaly_type = sample_path.parent.name
             else:
                 anomaly_type = sample_path.stem.split('_', 1)[-1]
             point_scores = np.asarray(extractor.predictions[-1]).reshape(-1)
+            if args.dataset == 'mvtec' and (
+                    np.asarray(extractor.predictions[-1]).shape != (224, 224)
+                    or point_scores.size != mask.numel()):
+                raise ValueError(f'MVTec anomaly map and GT pixels differ: {sample_path}')
             top1_count = max(1, int(np.ceil(point_scores.size * 0.01)))
             top5_count = max(1, int(np.ceil(point_scores.size * 0.05)))
             diagnostic_rows.append({
@@ -784,10 +932,19 @@ def evaluate_geometry_mlp(args):
         extractor.calculate_metrics()
         result = (extractor.image_rocauc, extractor.pixel_rocauc, p_aupr)
         results.append(result)
-        print(f'{category}: O-AUROC={result[0]:.3f}, P-AUROC={result[1]:.3f}, P-AUPR={result[2]:.3f}')
+        if args.dataset == 'mvtec':
+            au_pro_results.append(extractor.au_pro)
+            print(f'{category}: O-AUROC={result[0]:.3f}, P-AUROC={result[1]:.3f}, '
+                  f'P-AUPR={result[2]:.3f}, AU-PRO={extractor.au_pro:.3f}')
+        else:
+            print(f'{category}: O-AUROC={result[0]:.3f}, P-AUROC={result[1]:.3f}, P-AUPR={result[2]:.3f}')
     if len(categories) > 1:
         mean = np.nanmean(np.asarray(results), axis=0)
-        print(f'Mean: O-AUROC={mean[0]:.3f}, P-AUROC={mean[1]:.3f}, P-AUPR={mean[2]:.3f}')
+        if args.dataset == 'mvtec':
+            print(f'Mean: O-AUROC={mean[0]:.3f}, P-AUROC={mean[1]:.3f}, '
+                  f'P-AUPR={mean[2]:.3f}, AU-PRO={np.mean(au_pro_results):.3f}')
+        else:
+            print(f'Mean: O-AUROC={mean[0]:.3f}, P-AUROC={mean[1]:.3f}, P-AUPR={mean[2]:.3f}')
     checkpoint_path = Path(args.geom_checkpoint).resolve()
     csv_dir = (Path(__file__).resolve().parent / 'diagnostics' /
                checkpoint_path.parent.name / checkpoint_path.stem)

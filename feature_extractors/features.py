@@ -74,7 +74,11 @@ class Features(torch.nn.Module):
 
         unorganized_pc = unorganized_pc.numpy()
         if self.args.dataset == 'mvtec' or self.args.dataset == 'eyecandies':
-            nonzero_indices = np.nonzero(np.all(unorganized_pc != 0, axis=1))[0]
+            valid = np.all(unorganized_pc != 0, axis=1)
+            if (self.args.dataset == 'mvtec'
+                    and getattr(self.args, 'detector', 'simple3d') == 'geometry_mlp'):
+                valid &= np.isfinite(unorganized_pc).all(axis=1)
+            nonzero_indices = np.nonzero(valid)[0]
             
 
         full_data_list = []

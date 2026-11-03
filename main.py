@@ -249,17 +249,20 @@ if __name__ == '__main__':
                             help='PCD server data or the author\'s preprocessed ASC/TXT data')
         parser.add_argument('--real3d_root', type=str, default=None,
                             help='Root of the official preprocessed Real3D-AD dataset')
+        parser.add_argument('--mvtec_root', type=str, default=os.environ.get('MVTEC3D_ROOT'),
+                            help='Root of the MVTec 3D-AD XYZ TIFF dataset')
         args = parser.parse_args()
         if args.official_real3d:
             args.dataset = 'real'
+        geometry_mvtec = args.detector == 'geometry_mlp' and args.dataset == 'mvtec'
         if args.num_group is None:
-            args.num_group = 4096 if args.official_real3d else 2048
+            args.num_group = 4096 if args.official_real3d or geometry_mvtec else 2048
         if args.max_nn is None:
-            args.max_nn = 40 if args.official_real3d else 100
+            args.max_nn = 40 if args.official_real3d or geometry_mvtec else 100
         if args.use_MSND is None:
-            args.use_MSND = args.official_real3d
+            args.use_MSND = args.official_real3d or geometry_mvtec
         if args.use_LFSA is None:
-            args.use_LFSA = args.official_real3d
+            args.use_LFSA = args.official_real3d or geometry_mvtec
         if args.real3d_format is None:
             args.real3d_format = 'official' if args.official_real3d else 'pcd'
         if args.agg_method == 'ncrp' and not args.use_LFSA:
@@ -269,10 +272,18 @@ if __name__ == '__main__':
         if args.detector == 'simple3d':
             run_3d_ads(args)
         else:
-            if args.dataset != 'real' or args.feature != 'FPFH' or args.agg_method != 'mean' or not args.use_LFSA:
-                raise ValueError('geometry_mlp requires dataset=real, feature=FPFH, agg_method=mean, and use_LFSA=True.')
+            if args.dataset not in ('real', 'mvtec') or args.feature != 'FPFH' or args.agg_method != 'mean' or not args.use_LFSA:
+                raise ValueError('geometry_mlp requires dataset=real or mvtec, feature=FPFH, agg_method=mean, and use_LFSA=True.')
+            if geometry_mvtec and not args.mvtec_root:
+                raise ValueError('MVTec geometry_mlp requires --mvtec_root or MVTEC3D_ROOT.')
+            if geometry_mvtec and (args.num_group != 4096 or args.group_size != 128
+                                   or not args.use_MSND or args.num_MSND != 2
+                                   or args.msnd_impl != 'official'):
+                raise ValueError('MVTec geometry_mlp requires 4096 FPS groups, 128 KNN neighbors, and official 132-D MSND.')
             if args.geom_action is None:
                 raise ValueError('geometry_mlp requires --geom_action train, eval, or diagnose.')
+            if geometry_mvtec and args.geom_action == 'diagnose':
+                raise NotImplementedError('MVTec geometry_mlp diagnose mode is not implemented; use train or eval.')
             from geometry_mlp_runner import train_geometry_mlp, evaluate_geometry_mlp
             if args.geom_action == 'train':
                 train_geometry_mlp(args)
