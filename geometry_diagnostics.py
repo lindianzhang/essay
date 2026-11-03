@@ -123,9 +123,13 @@ def save_anomaly_comparison(record, output_dir, seed=42):
     points = record['points']
     gt = np.asarray(record['gt']).reshape(-1)
     geometry_scores = np.asarray(record['geometry_scores']).reshape(-1)
-    baseline_scores = np.asarray(record['baseline_scores']).reshape(-1)
-    if any(array.shape[0] != len(points) for array in (gt, geometry_scores, baseline_scores)):
-        raise ValueError('Points, GT, and both point score arrays must have identical lengths.')
+    baseline_data = record.get('baseline_scores')
+    baseline_scores = (np.asarray(baseline_data, dtype=np.float64).reshape(-1)
+                       if baseline_data is not None else np.full(len(points), np.nan))
+    if gt.size != len(points) or geometry_scores.size != len(points):
+        raise ValueError('Points, GT, and Geometry MLP scores must have identical lengths.')
+    if baseline_scores.size != len(points):
+        baseline_scores = np.full(len(points), np.nan)
     sample_path = record['sample']
     stem = _cache_path(output_dir, record['category'], sample_path).stem
     rng = np.random.default_rng(seed)
