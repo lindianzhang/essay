@@ -1,0 +1,15 @@
+﻿{
+  "terminal.integrated.profiles.windows": {
+    "MiniShift RTX4060": {
+      "path": "powershell.exe",
+      "args": [
+        "-NoExit",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        "& 'D:\\Desktop\\MiniShift-Simple3D-main\\init4060.ps1'"
+      ]
+    }
+  },
+  "terminal.integrated.defaultProfile.windows": "MiniShift RTX4060"
+}

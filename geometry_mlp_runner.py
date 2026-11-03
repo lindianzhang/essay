@@ -703,6 +703,7 @@ def train_geometry_mlp(args):
 
 def evaluate_geometry_mlp(args):
     import csv
+    from datetime import datetime, timezone
     from data.real3d import DATASETS_PATH, OFFICIAL_DATASETS_PATH
 
     checkpoint = torch.load(args.geom_checkpoint, map_location='cpu')
@@ -787,10 +788,19 @@ def evaluate_geometry_mlp(args):
     if len(categories) > 1:
         mean = np.nanmean(np.asarray(results), axis=0)
         print(f'Mean: O-AUROC={mean[0]:.3f}, P-AUROC={mean[1]:.3f}, P-AUPR={mean[2]:.3f}')
-    csv_path = (Path(__file__).resolve().parent / 'diagnostics' /
-                'airplane_concat136_e50' / 'full_test_scores.csv')
-    csv_path.parent.mkdir(parents=True, exist_ok=True)
-    with csv_path.open('w', newline='', encoding='utf-8') as output:
+    checkpoint_path = Path(args.geom_checkpoint).resolve()
+    csv_dir = (Path(__file__).resolve().parent / 'diagnostics' /
+               checkpoint_path.parent.name / checkpoint_path.stem)
+    csv_dir.mkdir(parents=True, exist_ok=True)
+    while True:
+        timestamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
+        csv_path = csv_dir / f'full_test_scores_{timestamp}.csv'
+        try:
+            output = open(csv_path, 'x', newline='', encoding='utf-8')
+            break
+        except FileExistsError:
+            continue
+    with output:
         writer = csv.DictWriter(output, fieldnames=(
             'sample_relative_path', 'anomaly_type', 'label', 'image_score',
             'point_mean', 'point_max', 'point_top1_percent_mean',
@@ -798,4 +808,5 @@ def evaluate_geometry_mlp(args):
         ))
         writer.writeheader()
         writer.writerows(diagnostic_rows)
+    print(f'Test score CSV saved: {csv_path.resolve()}')
     return results
