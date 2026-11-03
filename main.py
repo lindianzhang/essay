@@ -231,7 +231,7 @@ if __name__ == '__main__':
         parser.add_argument(
             '--pseudo_generator',
             type=str,
-            choices=['custom', 'nature3d'],
+            choices=['custom', 'nature3d', 'nature3d_multiscale'],
             default='nature3d'
         )
         parser.add_argument('--geom_use_position', type=parse_bool, default=True)

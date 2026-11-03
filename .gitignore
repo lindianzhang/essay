@@ -21,3 +21,6 @@ __pycache__/
 
 # Local diagnostic results
 /diagnostics/
+
+# All pseudo anomaly experiment caches
+/pseudo_cache_*/

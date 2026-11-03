@@ -25,6 +25,8 @@ _FEATURE_KEYS = ('geometry', 'position', 'curvature')
 _EXTRACTION_KEYS = ('num_group', 'group_size', 'max_nn', 'use_MSND',
                     'num_MSND', 'msnd_impl', 'curvature_k')
 _CACHE_VERSION = 1
+_MULTISCALE_GENERATOR_VERSION = 1
+_MULTISCALE_PART_NUMS = (384, 192, 96, 48)
 _SOURCE_FINGERPRINT_CACHE = {}
 
 
@@ -153,7 +155,7 @@ def _load_or_generate_pseudo(points, sample_id, anomaly_index, seed, normals,
             pass  # Regenerate only this missing or damaged cache entry.
 
     item_rng = np.random.default_rng(seed)
-    if generator == 'nature3d':
+    if generator in ('nature3d', 'nature3d_multiscale'):
         if normals is None:
             normals = {}
         if 'values' not in normals:
@@ -161,6 +163,9 @@ def _load_or_generate_pseudo(points, sample_id, anomaly_index, seed, normals,
         changed, point_mask, metadata = generate_nature3d_pseudo_anomaly(
             points, item_rng, config=generator_config, normals=normals['values']
         )
+        if generator == 'nature3d_multiscale':
+            metadata = {**metadata, 'part_num': int(generator_config['part_num']),
+                        'generator_version': _MULTISCALE_GENERATOR_VERSION}
     elif generator == 'custom':
         anomaly_type = generator_config['anomaly_type']
         changed, point_mask, metadata = generate_pseudo_anomaly(
@@ -291,10 +296,23 @@ def _collect_examples(args, extractor, samples, normals, statistics, rng, count,
                         'anomaly_type': ('bump', 'dent', 'scratch')[index % 3],
                         'parameters': {},
                     }
-                else:
+                elif args.pseudo_generator == 'nature3d':
                     generator_config = {
                         'part_num': 96, 'distance_range': [0.06, 0.08]
                     }
+                elif args.pseudo_generator == 'nature3d_multiscale':
+                    scale_seed = int.from_bytes(
+                        hashlib.sha256(seed_input + b':scale').digest()[:8], 'big'
+                    )
+                    part_num = int(np.random.default_rng(scale_seed).choice(
+                        _MULTISCALE_PART_NUMS, p=(0.25, 0.25, 0.25, 0.25)
+                    ))
+                    generator_config = {
+                        'part_num': part_num, 'distance_range': [0.06, 0.08],
+                        'multiscale_version': _MULTISCALE_GENERATOR_VERSION,
+                    }
+                else:
+                    raise ValueError(f'Unknown pseudo generator: {args.pseudo_generator}')
                 pseudo_key = _make_cache_key(
                     points, sample_id, category, split, index,
                     args.pseudo_generator, generator_config, item_seed
@@ -448,12 +466,20 @@ def train_geometry_mlp(args):
             for index, (pc, sample_id) in enumerate(samples):
                 split = 'validation' if index == held_out else 'train'
                 points = pc.squeeze(0).numpy()
-                generator_config = (
-                    {'part_num': 96, 'distance_range': [0.06, 0.08]}
-                    if args.pseudo_generator == 'nature3d' else
-                    {'anomaly_types': ['bump', 'dent', 'scratch'],
-                     'scale_probabilities': [0.7, 0.2, 0.1]}
-                )
+                if args.pseudo_generator == 'nature3d':
+                    generator_config = {'part_num': 96, 'distance_range': [0.06, 0.08]}
+                elif args.pseudo_generator == 'nature3d_multiscale':
+                    generator_config = {
+                        'part_num_choices': list(_MULTISCALE_PART_NUMS),
+                        'part_num_probabilities': [0.25, 0.25, 0.25, 0.25],
+                        'distance_range': [0.06, 0.08],
+                        'multiscale_version': _MULTISCALE_GENERATOR_VERSION,
+                    }
+                else:
+                    generator_config = {
+                        'anomaly_types': ['bump', 'dent', 'scratch'],
+                        'scale_probabilities': [0.7, 0.2, 0.1],
+                    }
                 group_key = _make_cache_key(
                     points, sample_id, category, split, None,
                     args.pseudo_generator, generator_config, args.geom_seed,
@@ -541,6 +567,11 @@ def train_geometry_mlp(args):
         'pseudo_generator_config': (
             {'part_num': 96, 'distance_range': [0.06, 0.08]}
             if args.pseudo_generator == 'nature3d' else
+            {'part_num_choices': list(_MULTISCALE_PART_NUMS),
+             'part_num_probabilities': [0.25, 0.25, 0.25, 0.25],
+             'distance_range': [0.06, 0.08],
+             'multiscale_version': _MULTISCALE_GENERATOR_VERSION}
+            if args.pseudo_generator == 'nature3d_multiscale' else
             {'anomaly_types': ['bump', 'dent', 'scratch'],
              'scale_probabilities': [0.7, 0.2, 0.1]}
         ),
