@@ -671,6 +671,9 @@ def train_geometry_mlp(args):
 
 
 def evaluate_geometry_mlp(args):
+    import csv
+    from data.real3d import DATASETS_PATH, OFFICIAL_DATASETS_PATH
+
     checkpoint = torch.load(args.geom_checkpoint, map_location='cpu')
     trained_categories = checkpoint.get('trained_categories')
     if trained_categories is None:
@@ -698,6 +701,9 @@ def evaluate_geometry_mlp(args):
     model.eval()
     statistics = checkpoint['normalization']
     results = []
+    diagnostic_rows = []
+    data_root = (args.real3d_root or OFFICIAL_DATASETS_PATH
+                 if args.real3d_format == 'official' else DATASETS_PATH)
     for category in categories:
         extractor.init_para()
         bank = checkpoint['memory_bank'][category].to(args.device)
@@ -709,6 +715,36 @@ def evaluate_geometry_mlp(args):
                 group['features'], mask, label, path, pc.squeeze(0),
                 group['points'].unsqueeze(0).to(args.device), group['center'].to(args.device),
                 external_patch_scores=scores)
+            sample_path = Path(path[0] if isinstance(path, (list, tuple)) else path)
+            relative_path = sample_path.resolve().relative_to(Path(data_root).resolve())
+            is_anomaly = int(torch.as_tensor(label).reshape(-1)[0].item())
+            if not is_anomaly:
+                anomaly_type = 'good'
+            elif args.real3d_format == 'official':
+                anomaly_type = sample_path.parent.name
+            else:
+                anomaly_type = sample_path.stem.split('_', 1)[-1]
+            point_scores = np.asarray(extractor.predictions[-1]).reshape(-1)
+            top1_count = max(1, int(np.ceil(point_scores.size * 0.01)))
+            top5_count = max(1, int(np.ceil(point_scores.size * 0.05)))
+            diagnostic_rows.append({
+                'sample_relative_path': relative_path.as_posix(),
+                'anomaly_type': anomaly_type,
+                'label': is_anomaly,
+                'image_score': float(np.asarray(extractor.image_preds[-1]).reshape(-1)[0]),
+                'point_mean': float(point_scores.mean()),
+                'point_max': float(point_scores.max()),
+                'point_top1_percent_mean': float(
+                    np.partition(point_scores, -top1_count)[-top1_count:].mean()
+                ),
+                'point_top5_percent_mean': float(
+                    np.partition(point_scores, -top5_count)[-top5_count:].mean()
+                ),
+                'point_p99': float(np.percentile(point_scores, 99)),
+                'gt_anomaly_ratio': float(
+                    (torch.as_tensor(mask).reshape(-1) > 0).float().mean().item()
+                ),
+            })
         pixel_labels = np.asarray(extractor.pixel_labels).reshape(-1)
         pixel_scores = np.asarray(extractor.pixel_preds).reshape(-1)
         p_aupr = (average_precision_score(pixel_labels, pixel_scores)
@@ -720,4 +756,15 @@ def evaluate_geometry_mlp(args):
     if len(categories) > 1:
         mean = np.nanmean(np.asarray(results), axis=0)
         print(f'Mean: O-AUROC={mean[0]:.3f}, P-AUROC={mean[1]:.3f}, P-AUPR={mean[2]:.3f}')
+    csv_path = (Path(__file__).resolve().parent / 'diagnostics' /
+                'airplane_concat136_e50' / 'full_test_scores.csv')
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with csv_path.open('w', newline='', encoding='utf-8') as output:
+        writer = csv.DictWriter(output, fieldnames=(
+            'sample_relative_path', 'anomaly_type', 'label', 'image_score',
+            'point_mean', 'point_max', 'point_top1_percent_mean',
+            'point_top5_percent_mean', 'point_p99', 'gt_anomaly_ratio'
+        ))
+        writer.writeheader()
+        writer.writerows(diagnostic_rows)
     return results

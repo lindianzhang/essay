@@ -18,3 +18,6 @@ __pycache__/
 # Local RTX 4060 test scripts
 /airplane_4060_original_test.py
 /airplane_4060_smoke.py
+
+# Local diagnostic results
+/diagnostics/

@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import Normalize
 import numpy as np
 import torch
+from sklearn.metrics import average_precision_score, roc_auc_score
 from torch.utils.data import DataLoader, Subset
 
 from data.real3d import real3d_classes
@@ -118,11 +119,11 @@ def _display_values(values):
 
 
 def save_anomaly_comparison(record, output_dir, seed=42):
-    """Save aligned raw arrays and one four-panel point-cloud image per sample."""
+    """Save full point scores as UTF-8 text and an aligned four-panel image."""
     points = record['points']
-    gt = record['gt']
-    geometry_scores = record['geometry_scores']
-    baseline_scores = record['baseline_scores']
+    gt = np.asarray(record['gt']).reshape(-1)
+    geometry_scores = np.asarray(record['geometry_scores']).reshape(-1)
+    baseline_scores = np.asarray(record['baseline_scores']).reshape(-1)
     if any(array.shape[0] != len(points) for array in (gt, geometry_scores, baseline_scores)):
         raise ValueError('Points, GT, and both point score arrays must have identical lengths.')
     sample_path = record['sample']
@@ -130,22 +131,74 @@ def save_anomaly_comparison(record, output_dir, seed=42):
     rng = np.random.default_rng(seed)
     display_indices = (np.sort(rng.choice(len(points), size=10000, replace=False))
                        if len(points) > 10000 else np.arange(len(points)))
-    arrays = {
-        'sample_path': sample_path,
-        'points': points, 'gt': gt,
-        'geometry_point_scores': geometry_scores,
-        'simple3d_point_scores': baseline_scores,
-        'display_indices': display_indices,
-        'center_idx': record['center_idx'], 'knn_idx': record['knn_idx'],
-        'group_features': record['group_features'], 'embedding': record['embedding'],
-        'positions': record['positions'], 'curvature': record['curvature'],
-        'gt_anomaly_ratio': record['ratios'],
-        'nearest_distance': record['distances'],
-        'nearest_bank_index': record['nearest_indices'],
-    }
-    if record['weights'] is not None:
-        arrays['gate_weights'] = record['weights']
-    np.savez_compressed(output_dir / f'{stem}.npz', **arrays)
+
+    sample_name = Path(sample_path).name
+    label = record.get('label', int(np.any(gt > 0)))
+    defect_type = ('good' if label == 0 else
+                   Path(sample_path).parent.name
+                   if Path(sample_path).parent.name != 'test' else
+                   Path(sample_path).stem.split('_', 1)[-1])
+    method_name = ('Concat-MLP' if record.get('architecture') == 'concat'
+                   else 'Geometry MLP')
+    gt_valid = bool(np.isfinite(gt).all() and np.isin(gt, (0, 1)).all())
+    anomaly_region = gt > 0
+
+    def number(value):
+        return format(float(value), '.17g') if np.isfinite(value) else 'N/A'
+
+    def summary(scores, selected):
+        values = np.asarray(scores, dtype=np.float64)[selected]
+        finite_count = int(np.isfinite(values).sum())
+        if values.size == 0 or finite_count != values.size:
+            return [values.size, finite_count] + ['N/A'] * 6
+        top1 = max(1, int(np.ceil(values.size * 0.01)))
+        top5 = max(1, int(np.ceil(values.size * 0.05)))
+        return [
+            values.size, finite_count, number(values.mean()), number(values.max()),
+            number(np.median(values)), number(np.percentile(values, 99)),
+            number(np.partition(values, values.size - top1)[-top1:].mean()),
+            number(np.partition(values, values.size - top5)[-top5:].mean()),
+        ]
+
+    with (output_dir / f'{stem}.txt').open('w', encoding='utf-8', newline='') as output:
+        output.write(f'Sample Name: {sample_name}\n')
+        output.write(f'Sample Path: {sample_path}\n')
+        output.write(f'Category: {record["category"]}\n')
+        output.write(f'Defect Type: {defect_type}\n')
+        output.write(f'Label: {"anomaly (1)" if label else "normal (0)"}\n')
+        output.write(f'Total Points: {len(points)}\n')
+        output.write(f'GT Anomaly Points: {int(anomaly_region.sum()) if gt_valid else "N/A"}\n')
+        output.write(f'GT Anomaly Ratio: {number(anomaly_region.mean()) if gt_valid else "N/A"}\n')
+        output.write('\nScore Statistics (raw scores; incomplete regions are N/A)\n')
+        writer = csv.writer(output, delimiter='\t', lineterminator='\n')
+        writer.writerow(('Method', 'Region', 'Point Count', 'Finite Score Count',
+                         'Mean', 'Max', 'Median', 'P99', 'Top-1% Mean', 'Top-5% Mean'))
+        methods = ((method_name, geometry_scores), ('Simple3D', baseline_scores))
+        for name, scores in methods:
+            writer.writerow((name, 'All Points', *summary(scores, np.ones(len(points), dtype=bool))))
+            for region_name, selected in (('GT Normal', ~anomaly_region),
+                                          ('GT Anomaly', anomaly_region)):
+                if gt_valid:
+                    writer.writerow((name, region_name, *summary(scores, selected)))
+                else:
+                    writer.writerow((name, region_name, 'N/A', 'N/A', *(['N/A'] * 6)))
+        output.write('\nSingle-Sample Point Metrics\n')
+        writer.writerow(('Method', 'P-AUROC', 'P-AUPR'))
+        for name, scores in methods:
+            if (gt_valid and anomaly_region.any() and (~anomaly_region).any()
+                    and np.isfinite(scores).all()):
+                writer.writerow((name, number(roc_auc_score(anomaly_region, scores)),
+                                 number(average_precision_score(anomaly_region, scores))))
+            else:
+                writer.writerow((name, 'N/A', 'N/A'))
+        output.write('\nPer-Point Data (original point order)\n')
+        writer.writerow(('Point Index', 'X', 'Y', 'Z', 'GT Label',
+                         f'{method_name} Score', 'Simple3D Score'))
+        for index, (point, gt_label, geometry_score, baseline_score) in enumerate(
+                zip(points, gt, geometry_scores, baseline_scores)):
+            writer.writerow((index, *(number(coordinate) for coordinate in point),
+                             number(gt_label), number(geometry_score),
+                             number(baseline_score)))
 
     shown = points[display_indices]
     lower = points.min(axis=0)
@@ -181,7 +234,7 @@ def save_anomaly_comparison(record, output_dir, seed=42):
                          ax=ax, shrink=0.55, pad=0.02)
     fig.suptitle(f"{record['category'].title()} | {Path(sample_path).name}")
     fig.text(0.5, 0.02,
-             'Score colors use separate 5th-99th percentile scaling for display only; raw scores are in the NPZ.',
+             'Score colors use separate 5th-99th percentile scaling for display only; raw scores are in the TXT.',
              ha='center', fontsize=9)
     fig.savefig(output_dir / f'{stem}.png', dpi=180, bbox_inches='tight')
     plt.close(fig)
@@ -357,6 +410,8 @@ def run_geometry_diagnostics(args):
             _, ratios = build_group_labels(mask.reshape(-1), group['knn_idx'])
             record = {
                 'category': category, 'sample': sample_path, 'points': points,
+                'label': int(torch.as_tensor(label).reshape(-1)[0].item()),
+                'architecture': architecture,
                 'gt': gt, 'geometry_scores': scores,
                 'baseline_scores': baseline_scores.get(sample_path, np.full(len(points), np.nan)),
                 'center_idx': group['center_idx'].numpy(),
